@@ -38,14 +38,33 @@ WM_NCHITTEST = 0x0084
 WM_DESTROY = 0x0002
 WM_DISPLAYCHANGE = 0x007E
 
+VK_BACK = 0x08
 VK_TAB = 0x09
-VK_ESCAPE = 0x1B
+VK_RETURN = 0x0D
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
 VK_MENU = 0x12  # Alt
+VK_ESCAPE = 0x1B
+VK_SPACE = 0x20
+VK_PRIOR = 0x21
+VK_NEXT = 0x22
+VK_END = 0x23
+VK_HOME = 0x24
+VK_LEFT = 0x25
+VK_UP = 0x26
+VK_RIGHT = 0x27
+VK_DOWN = 0x28
+VK_DELETE = 0x2E
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+VK_NUMPAD0 = 0x60
+VK_LSHIFT = 0xA0
+VK_RSHIFT = 0xA1
+VK_LCONTROL = 0xA2
+VK_RCONTROL = 0xA3
 VK_LMENU = 0xA4
 VK_RMENU = 0xA5
-VK_LEFT = 0x25
-VK_RIGHT = 0x27
-VK_SHIFT = 0x10
+VK_OEM_3 = 0xC0  # backtick / grave
 
 ICON_SMALL = 0
 ICON_BIG = 1
@@ -233,7 +252,11 @@ class WINDOWCOMPOSITIONATTRIBDATA(ctypes.Structure):
     ]
 
 
-# Accent states for SetWindowCompositionAttribute
+# Accent states for SetWindowCompositionAttribute. The overlay does not use
+# these: on a full-screen topmost window this API returns success and then
+# composites a flat tint with no trace of the windows behind it, which is what
+# made the backdrop look black. Kept so backdrop_probe.py can demonstrate that
+# on any given build before someone tries it again.
 ACCENT_DISABLED = 0
 ACCENT_ENABLE_BLURBEHIND = 3
 ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
@@ -273,6 +296,8 @@ user32.GetWindowThreadProcessId.argtypes = [
     ctypes.POINTER(wintypes.DWORD),
 ]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.SetCursorPos.restype = wintypes.BOOL
 user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(POINT)]
 user32.ScreenToClient.restype = wintypes.BOOL
 user32.MonitorFromPoint.argtypes = [POINT, wintypes.DWORD]
@@ -446,3 +471,316 @@ user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEM
 user32.GetWindowPlacement.restype = wintypes.BOOL
 user32.SetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
 user32.SetWindowPlacement.restype = wintypes.BOOL
+
+# ---------------------------------------------------------------------------
+# Handle-returning calls need explicit restypes: ctypes defaults to c_int,
+# which silently truncates 64-bit handles (HDC/HBITMAP/HICON) to 32 bits.
+# ---------------------------------------------------------------------------
+LRESULT = ctypes.c_ssize_t
+
+user32.GetDC.argtypes = [wintypes.HWND]
+user32.GetDC.restype = wintypes.HDC
+user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+user32.ReleaseDC.restype = ctypes.c_int
+user32.GetWindowDC.argtypes = [wintypes.HWND]
+user32.GetWindowDC.restype = wintypes.HDC
+user32.SendMessageW.argtypes = [
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+]
+user32.SendMessageW.restype = LRESULT
+user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.UpdateLayeredWindow.restype = wintypes.BOOL
+user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+user32.MonitorFromWindow.restype = wintypes.HMONITOR
+user32.MonitorFromPoint.restype = wintypes.HMONITOR
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.IsZoomed.argtypes = [wintypes.HWND]
+user32.IsZoomed.restype = wintypes.BOOL
+user32.GetKeyState.argtypes = [ctypes.c_int]
+user32.GetKeyState.restype = wintypes.SHORT
+user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+user32.SetWindowLongW.restype = wintypes.LONG
+user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetAncestor.restype = wintypes.HWND
+user32.GetShellWindow.restype = wintypes.HWND
+user32.SwitchToThisWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
+user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
+user32.AllowSetForegroundWindow.restype = wintypes.BOOL
+user32.keybd_event.argtypes = [
+    wintypes.BYTE,
+    wintypes.BYTE,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+]
+
+ASFW_ANY = 0xFFFFFFFF
+KEYEVENTF_KEYUP = 0x0002
+
+MAPVK_VK_TO_CHAR = 2
+user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+user32.MapVirtualKeyW.restype = wintypes.UINT
+
+
+def vk_to_char(vk: int) -> str:
+    """Layout-aware VK -> character, without disturbing dead-key state."""
+    value = int(user32.MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR)) & 0xFFFF
+    if value < 32:
+        return ""
+    char = chr(value)
+    return char if char.isprintable() else ""
+
+gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+gdi32.CreateCompatibleDC.restype = wintypes.HDC
+gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+gdi32.SelectObject.restype = wintypes.HGDIOBJ
+gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+gdi32.DeleteObject.restype = wintypes.BOOL
+gdi32.DeleteDC.argtypes = [wintypes.HDC]
+gdi32.DeleteDC.restype = wintypes.BOOL
+gdi32.CreateSolidBrush.argtypes = [wintypes.COLORREF]
+gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+user32.FillRect.argtypes = [wintypes.HDC, ctypes.POINTER(RECT), wintypes.HBRUSH]
+user32.FillRect.restype = ctypes.c_int
+gdi32.CreateDIBSection.argtypes = [
+    wintypes.HDC,
+    ctypes.POINTER(BITMAPINFO),
+    wintypes.UINT,
+    ctypes.POINTER(ctypes.c_void_p),
+    wintypes.HANDLE,
+    wintypes.DWORD,
+]
+gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+gdi32.GetDIBits.argtypes = [
+    wintypes.HDC,
+    wintypes.HBITMAP,
+    wintypes.UINT,
+    wintypes.UINT,
+    ctypes.c_void_p,
+    ctypes.POINTER(BITMAPINFO),
+    wintypes.UINT,
+]
+gdi32.GetDIBits.restype = ctypes.c_int
+gdi32.StretchBlt.argtypes = [
+    wintypes.HDC,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.HDC,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.DWORD,
+]
+gdi32.StretchBlt.restype = wintypes.BOOL
+gdi32.SetStretchBltMode.argtypes = [wintypes.HDC, ctypes.c_int]
+gdi32.SetStretchBltMode.restype = ctypes.c_int
+gdi32.GdiFlush.restype = wintypes.BOOL
+
+SRCCOPY = 0x00CC0020
+HALFTONE = 4
+COLORONCOLOR = 3
+
+
+# ---------------------------------------------------------------------------
+# WM_PAINT plumbing for the backdrop window. It is an ordinary opaque window
+# (a layered one would mean uploading a screen-sized bitmap per frame), so it
+# repaints itself the normal way.
+# ---------------------------------------------------------------------------
+
+
+class PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("hdc", wintypes.HDC),
+        ("fErase", wintypes.BOOL),
+        ("rcPaint", RECT),
+        ("fRestore", wintypes.BOOL),
+        ("fIncUpdate", wintypes.BOOL),
+        ("rgbReserved", ctypes.c_byte * 32),
+    ]
+
+
+user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.POINTER(PAINTSTRUCT)]
+user32.BeginPaint.restype = wintypes.HDC
+user32.EndPaint.argtypes = [wintypes.HWND, ctypes.POINTER(PAINTSTRUCT)]
+user32.EndPaint.restype = wintypes.BOOL
+user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT), wintypes.BOOL]
+user32.InvalidateRect.restype = wintypes.BOOL
+user32.UpdateWindow.argtypes = [wintypes.HWND]
+user32.UpdateWindow.restype = wintypes.BOOL
+user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+user32.GetClientRect.restype = wintypes.BOOL
+
+# ---------------------------------------------------------------------------
+# SendMessageTimeout — WM_GETICON against a hung app would otherwise block the
+# whole UI thread until that app responds.
+# ---------------------------------------------------------------------------
+SMTO_ABORTIFHUNG = 0x0002
+SMTO_BLOCK = 0x0001
+
+user32.SendMessageTimeoutW.argtypes = [
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+    wintypes.UINT,
+    wintypes.UINT,
+    ctypes.POINTER(ctypes.c_size_t),
+]
+user32.SendMessageTimeoutW.restype = LRESULT
+
+
+def send_message_timeout(hwnd: int, msg: int, wparam: int, lparam: int, ms: int = 60) -> int:
+    """SendMessageW that gives up instead of hanging on an unresponsive window."""
+    out = ctypes.c_size_t(0)
+    ok = user32.SendMessageTimeoutW(
+        hwnd, msg, wparam, lparam, SMTO_ABORTIFHUNG | SMTO_BLOCK, ms, ctypes.byref(out)
+    )
+    return int(out.value) if ok else 0
+
+
+# ---------------------------------------------------------------------------
+# WinEvent hooks — used to keep a real most-recently-used window order.
+# ---------------------------------------------------------------------------
+EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_SYSTEM_MINIMIZESTART = 0x0016
+EVENT_SYSTEM_MINIMIZEEND = 0x0017
+EVENT_OBJECT_DESTROY = 0x8001
+EVENT_OBJECT_NAMECHANGE = 0x800C
+WINEVENT_OUTOFCONTEXT = 0x0000
+WINEVENT_SKIPOWNPROCESS = 0x0002
+OBJID_WINDOW = 0
+
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None,
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.HWND,
+    wintypes.LONG,
+    wintypes.LONG,
+    wintypes.DWORD,
+    wintypes.DWORD,
+)
+
+user32.SetWinEventHook.argtypes = [
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HMODULE,
+    WINEVENTPROC,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.DWORD,
+]
+user32.SetWinEventHook.restype = wintypes.HANDLE
+user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+user32.UnhookWinEvent.restype = wintypes.BOOL
+
+# ---------------------------------------------------------------------------
+# Per-monitor DPI. Without this Windows bitmap-stretches the overlay on
+# scaled displays, which looks soft and misplaces hit-testing.
+# ---------------------------------------------------------------------------
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+MDT_EFFECTIVE_DPI = 0
+
+
+def enable_dpi_awareness() -> None:
+    try:
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        if user32.SetProcessDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        ):
+            return
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.WinDLL("shcore").SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        return
+    except (AttributeError, OSError):
+        pass
+    try:
+        user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
+
+def monitor_dpi(hmonitor: int) -> int:
+    """Effective DPI for a monitor; 96 means 100% scaling."""
+    try:
+        shcore = ctypes.WinDLL("shcore")
+        dpi_x = wintypes.UINT()
+        dpi_y = wintypes.UINT()
+        if (
+            shcore.GetDpiForMonitor(
+                wintypes.HMONITOR(hmonitor),
+                MDT_EFFECTIVE_DPI,
+                ctypes.byref(dpi_x),
+                ctypes.byref(dpi_y),
+            )
+            == 0
+        ):
+            return int(dpi_x.value) or 96
+    except (AttributeError, OSError):
+        pass
+    return 96
+
+
+# ---------------------------------------------------------------------------
+# Process image name — used for per-app grouping and nicer display names.
+# ---------------------------------------------------------------------------
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
+kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+
+def process_image_path(pid: int) -> str:
+    if not pid:
+        return ""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+# ---------------------------------------------------------------------------
+# Windows accent colour, so the wheel can match the user's system theme.
+# ---------------------------------------------------------------------------
+dwmapi.DwmGetColorizationColor.argtypes = [
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.BOOL),
+]
+dwmapi.DwmGetColorizationColor.restype = ctypes.c_long
+
+
+def accent_rgb() -> tuple[int, int, int] | None:
+    color = wintypes.DWORD()
+    opaque = wintypes.BOOL()
+    try:
+        if dwmapi.DwmGetColorizationColor(ctypes.byref(color), ctypes.byref(opaque)) != 0:
+            return None
+    except OSError:
+        return None
+    value = int(color.value)
+    return ((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF)

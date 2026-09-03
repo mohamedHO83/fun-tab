@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fun-tab"
+version = "0.2.0"
+description = "GTA-style radial Alt+Tab switcher for Windows"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Environment :: Win32 (MS Windows)",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Programming Language :: Python :: 3",
+    "Topic :: Desktop Environment :: Window Managers",
+]
+dependencies = [
+    "Pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "pystray>=0.19.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+fun-tab = "fun_tab:main"
+
+[project.gui-scripts]
+fun-tab-tray = "fun_tab:main"
+
+[tool.setuptools]
+packages = ["fun_tab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

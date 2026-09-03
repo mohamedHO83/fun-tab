@@ -1,15 +1,38 @@
-"""Enumerate switchable windows, extract icons, and activate targets."""
+"""Enumerate switchable windows, extract icons, capture previews, activate targets."""
 
 from __future__ import annotations
 
 import ctypes
+import os
+import threading
 from ctypes import wintypes
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Iterable, Optional
 
+import numpy as np
 from PIL import Image
 
 from . import win32_types as w
+
+ICON_PX = 96
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
+
+w.shell32.ExtractIconExW.argtypes = [
+    wintypes.LPCWSTR,
+    ctypes.c_int,
+    ctypes.POINTER(wintypes.HICON),
+    ctypes.POINTER(wintypes.HICON),
+    wintypes.UINT,
+]
+w.shell32.ExtractIconExW.restype = wintypes.UINT
+w.user32.DestroyIcon.argtypes = [wintypes.HICON]
+w.user32.DestroyIcon.restype = wintypes.BOOL
+
+_icon_lock = threading.Lock()
+_icon_by_hwnd: dict[int, Optional[Image.Image]] = {}
+_icon_by_exe: dict[str, Optional[Image.Image]] = {}
+_appname_by_exe: dict[str, str] = {}
+_exe_by_pid: dict[int, str] = {}
 
 
 @dataclass
@@ -19,22 +42,47 @@ class AppWindow:
     class_name: str
     pid: int
     icon: Optional[Image.Image] = field(default=None, repr=False)
+    exe_path: str = ""
+    app_name: str = ""
+    minimized: bool = False
+    maximized: bool = False
+
+    @property
+    def exe_name(self) -> str:
+        return os.path.basename(self.exe_path) if self.exe_path else ""
 
     @property
     def display_name(self) -> str:
+        """Primary label: the window title, minus a redundant app-name suffix."""
         title = (self.title or "").strip()
-        if title:
-            # Prefer the app-ish part after the last separator when titles are long.
-            for sep in (" - ", " — ", " | "):
-                if sep in title:
-                    left, right = title.rsplit(sep, 1)
-                    # Usually "Document - App"; show App if short, else full.
-                    if 0 < len(right) <= 40:
-                        return right.strip()
-            if len(title) > 48:
-                return title[:45] + "…"
-            return title
-        return self.class_name or f"Window {self.hwnd}"
+        app = (self.app_name or "").strip()
+        if not title:
+            return app or self.class_name or f"Window {self.hwnd}"
+        if app:
+            for sep in (" - ", " — ", " – ", " | "):
+                suffix = f"{sep}{app}"
+                if title.endswith(suffix) and len(title) > len(suffix):
+                    return title[: -len(suffix)].strip()
+            if title == app:
+                return app
+        return title
+
+    @property
+    def subtitle(self) -> str:
+        """Secondary label: which application the window belongs to."""
+        app = (self.app_name or "").strip()
+        if app and app.lower() != self.display_name.strip().lower():
+            return app
+        return ""
+
+    @property
+    def search_text(self) -> str:
+        return f"{self.title} {self.app_name} {self.exe_name}".lower()
+
+
+# ---------------------------------------------------------------------------
+# Basic window queries
+# ---------------------------------------------------------------------------
 
 
 def _window_title(hwnd: int) -> str:
@@ -52,19 +100,47 @@ def _class_name(hwnd: int) -> str:
     return buf.value
 
 
-def _is_alt_tab_candidate(hwnd: int, self_hwnd: int | None) -> bool:
-    if self_hwnd and hwnd == self_hwnd:
+def _is_cloaked(hwnd: int) -> bool:
+    try:
+        cloaked = wintypes.DWORD()
+        DWMWA_CLOAKED = 14
+        hr = w.dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+        )
+        return hr == 0 and cloaked.value != 0
+    except Exception:
+        return False
+
+
+SKIP_CLASSES = frozenset(
+    {
+        "Progman",
+        "WorkerW",
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "NotifyIconOverflowWindow",
+        "Windows.UI.Core.CoreWindow",
+        "Windows.UI.Composition.DesktopWindowContentBridge",
+        "XamlExplorerHostIslandWindow",
+        "ForegroundStaging",
+        "MultitaskingViewFrame",
+        "TaskListThumbnailWnd",
+        "EdgeUiInputTopWndClass",
+    }
+)
+
+
+def _is_alt_tab_candidate(hwnd: int, exclude: set[int]) -> bool:
+    if hwnd in exclude:
         return False
     if not w.user32.IsWindowVisible(hwnd):
         return False
 
-    # Skip owned windows (tool windows, dialogs owned by a parent).
     GW_OWNER = 4
     if w.user32.GetWindow(hwnd, GW_OWNER):
         return False
 
-    title = _window_title(hwnd)
-    if not title.strip():
+    if not _window_title(hwnd).strip():
         return False
 
     GWL_EXSTYLE = -20
@@ -74,57 +150,35 @@ def _is_alt_tab_candidate(hwnd: int, self_hwnd: int | None) -> bool:
     if ex & WS_EX_TOOLWINDOW and not (ex & WS_EX_APPWINDOW):
         return False
 
-    # Cloaked UWP / invisible shells (Win10+)
     if _is_cloaked(hwnd):
         return False
 
     class_name = _class_name(hwnd)
-    skip_classes = {
-        "Progman",
-        "WorkerW",
-        "Shell_TrayWnd",
-        "Shell_SecondaryTrayWnd",
-        "NotifyIconOverflowWindow",
-        "Windows.UI.Core.CoreWindow",
-        "ApplicationFrameWindow",  # filtered further below if empty
-    }
-    # ApplicationFrameWindow without a useful child title often is a ghost UWP host.
-    if class_name in skip_classes and class_name != "ApplicationFrameWindow":
+    if class_name in SKIP_CLASSES:
         return False
-
     return True
 
 
-def _is_cloaked(hwnd: int) -> bool:
-    try:
-        cloaked = wintypes.DWORD()
-        DWMWA_CLOAKED = 14
-        hr = w.dwmapi.DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED,
-            ctypes.byref(cloaked),
-            ctypes.sizeof(cloaked),
-        )
-        return hr == 0 and cloaked.value != 0
-    except Exception:
-        return False
+# ---------------------------------------------------------------------------
+# Icons
+# ---------------------------------------------------------------------------
 
 
-def _hicon_to_image(hicon: int, size: int = 96) -> Optional[Image.Image]:
-    if not hicon:
+def _draw_icon_on(hicon: int, size: int, background: int) -> Optional[np.ndarray]:
+    """Rasterise an icon over a solid background and read back RGB."""
+    screen_dc = w.user32.GetDC(0)
+    if not screen_dc:
         return None
-
-    hdc = w.user32.GetDC(0)
-    if not hdc:
-        return None
-
+    mem_dc = 0
+    bmp = 0
     try:
-        mem_dc = w.gdi32.CreateCompatibleDC(hdc)
-        bmp = w.gdi32.CreateCompatibleBitmap(hdc, size, size)
+        mem_dc = w.gdi32.CreateCompatibleDC(screen_dc)
+        bmp = w.gdi32.CreateCompatibleBitmap(screen_dc, size, size)
+        if not mem_dc or not bmp:
+            return None
         old = w.gdi32.SelectObject(mem_dc, bmp)
 
-        # Clear to transparent-ish black then draw icon.
-        brush = w.gdi32.CreateSolidBrush(0x000000)
+        brush = w.gdi32.CreateSolidBrush(background)
         rect = w.RECT(0, 0, size, size)
         w.user32.FillRect(mem_dc, ctypes.byref(rect), brush)
         w.gdi32.DeleteObject(brush)
@@ -134,89 +188,320 @@ def _hicon_to_image(hicon: int, size: int = 96) -> Optional[Image.Image]:
         bmi = w.BITMAPINFO()
         bmi.bmiHeader.biSize = ctypes.sizeof(w.BITMAPINFOHEADER)
         bmi.bmiHeader.biWidth = size
-        bmi.bmiHeader.biHeight = -size  # top-down
+        bmi.bmiHeader.biHeight = -size
         bmi.bmiHeader.biPlanes = 1
         bmi.bmiHeader.biBitCount = 32
         bmi.bmiHeader.biCompression = w.BI_RGB
 
-        buf_len = size * size * 4
-        buf = (ctypes.c_ubyte * buf_len)()
-        w.gdi32.GetDIBits(mem_dc, bmp, 0, size, buf, ctypes.byref(bmi), w.DIB_RGB_COLORS)
-
+        buf = (ctypes.c_ubyte * (size * size * 4))()
+        got = w.gdi32.GetDIBits(
+            mem_dc, bmp, 0, size, buf, ctypes.byref(bmi), w.DIB_RGB_COLORS
+        )
         w.gdi32.SelectObject(mem_dc, old)
-        w.gdi32.DeleteObject(bmp)
-        w.gdi32.DeleteDC(mem_dc)
-
-        img = Image.frombuffer("RGBA", (size, size), bytes(buf), "raw", "BGRA", 0, 1).copy()
-        # Punch near-black drawn on opaque black canvas through to alpha.
-        try:
-            import numpy as np
-
-            arr = np.array(img)
-            mask = (arr[..., 0] < 8) & (arr[..., 1] < 8) & (arr[..., 2] < 8)
-            arr[mask, 3] = 0
-            return Image.fromarray(arr, "RGBA")
-        except Exception:
-            return img
+        if not got:
+            return None
+        arr = np.frombuffer(bytes(buf), dtype=np.uint8).reshape(size, size, 4)
+        return arr[..., 2::-1].astype(np.int16)  # BGRA -> RGB
     finally:
-        w.user32.ReleaseDC(0, hdc)
+        if bmp:
+            w.gdi32.DeleteObject(bmp)
+        if mem_dc:
+            w.gdi32.DeleteDC(mem_dc)
+        w.user32.ReleaseDC(0, screen_dc)
 
 
-def _extract_icon(hwnd: int) -> Optional[Image.Image]:
-    # Prefer window icons, then class icons — pull at 96px for sharp wheel icons.
+def _hicon_to_image(hicon: int, size: int = ICON_PX) -> Optional[Image.Image]:
+    """Recover true per-pixel alpha by drawing the icon on black and on white.
+
+    Over black a pixel reads ``C*a``; over white it reads ``C*a + (1-a)*255``.
+    Subtracting gives the alpha exactly, which keeps dark logos intact — the
+    previous "make near-black transparent" trick punched holes in them.
+    """
+    if not hicon:
+        return None
+
+    on_black = _draw_icon_on(hicon, size, 0x000000)
+    if on_black is None:
+        return None
+    on_white = _draw_icon_on(hicon, size, 0xFFFFFF)
+    if on_white is None:
+        return None
+
+    diff = np.clip(on_white - on_black, 0, 255)
+    a = 255 - diff.max(axis=2)
+    a = np.clip(a, 0, 255).astype(np.uint16)
+    if int(a.max()) == 0:
+        return None
+
+    safe = np.maximum(a, 1)[..., None]
+    rgb = np.clip(on_black.astype(np.int32) * 255 // safe, 0, 255).astype(np.uint8)
+
+    out = np.empty((size, size, 4), dtype=np.uint8)
+    out[..., :3] = rgb
+    out[..., 3] = a.astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
+
+
+def _icon_from_exe(path: str) -> Optional[Image.Image]:
+    if not path:
+        return None
+    large = wintypes.HICON()
+    try:
+        count = w.shell32.ExtractIconExW(path, 0, ctypes.byref(large), None, 1)
+    except OSError:
+        return None
+    if count <= 0 or not large.value:
+        return None
+    try:
+        return _hicon_to_image(int(large.value))
+    finally:
+        try:
+            w.user32.DestroyIcon(large)
+        except OSError:
+            pass
+
+
+def _extract_icon(hwnd: int, exe_path: str) -> Optional[Image.Image]:
+    with _icon_lock:
+        if hwnd in _icon_by_hwnd:
+            return _icon_by_hwnd[hwnd]
+        cached = _icon_by_exe.get(exe_path) if exe_path else None
+    if cached is not None:
+        with _icon_lock:
+            _icon_by_hwnd[hwnd] = cached
+        return cached
+
+    icon: Optional[Image.Image] = None
     for which in (w.ICON_BIG, w.ICON_SMALL2, w.ICON_SMALL):
-        hicon = w.user32.SendMessageW(hwnd, w.WM_GETICON, which, 0)
-        img = _hicon_to_image(hicon, 96)
-        if img is not None:
-            return img
+        hicon = w.send_message_timeout(hwnd, w.WM_GETICON, which, 0, ms=60)
+        icon = _hicon_to_image(hicon)
+        if icon is not None:
+            break
 
-    for index in (w.GCLP_HICON, w.GCLP_HICONSM):
-        hicon = w.get_class_long(hwnd, index)
-        img = _hicon_to_image(hicon, 96)
-        if img is not None:
-            return img
+    if icon is None:
+        for index in (w.GCLP_HICON, w.GCLP_HICONSM):
+            icon = _hicon_to_image(w.get_class_long(hwnd, index))
+            if icon is not None:
+                break
 
-    # Fallback: generic rounded square
-    img = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
+    if icon is None:
+        icon = _icon_from_exe(exe_path)
+
+    if icon is None:
+        icon = _placeholder_icon()
+
+    with _icon_lock:
+        _icon_by_hwnd[hwnd] = icon
+        if exe_path:
+            _icon_by_exe.setdefault(exe_path, icon)
+    return icon
+
+
+def _placeholder_icon() -> Image.Image:
     from PIL import ImageDraw
 
+    img = Image.new("RGBA", (ICON_PX, ICON_PX), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle((8, 8, 88, 88), radius=18, fill=(220, 220, 220, 230))
+    draw.rounded_rectangle((8, 8, 88, 88), radius=20, fill=(196, 202, 214, 235))
+    draw.rounded_rectangle((8, 8, 88, 30), radius=10, fill=(150, 158, 176, 235))
     return img
 
 
-def enumerate_windows(self_hwnd: int | None = None) -> list[AppWindow]:
-    result: list[AppWindow] = []
+def prune_icon_cache(live_hwnds: Iterable[int]) -> None:
+    live = set(int(h) for h in live_hwnds)
+    with _icon_lock:
+        for hwnd in [h for h in _icon_by_hwnd if h not in live]:
+            _icon_by_hwnd.pop(hwnd, None)
 
-    @w.WNDENUMPROC
-    def enum_proc(hwnd, _lparam):
-        if _is_alt_tab_candidate(hwnd, self_hwnd):
-            pid = wintypes.DWORD()
-            w.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            result.append(
-                AppWindow(
-                    hwnd=int(hwnd),
-                    title=_window_title(hwnd),
-                    class_name=_class_name(hwnd),
-                    pid=int(pid.value),
-                    icon=_extract_icon(hwnd),
-                )
-            )
-        return True
 
-    w.user32.EnumWindows(enum_proc, 0)
+# ---------------------------------------------------------------------------
+# Application names (from the executable's version resource)
+# ---------------------------------------------------------------------------
+
+
+def _file_description(path: str) -> str:
+    if not path:
+        return ""
+    cached = _appname_by_exe.get(path)
+    if cached is not None:
+        return cached
+
+    name = os.path.splitext(os.path.basename(path))[0]
+    result = name.replace("_", " ").title() if name else ""
+    try:
+        version = ctypes.WinDLL("version", use_last_error=True)
+        version.GetFileVersionInfoSizeW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        version.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+        version.GetFileVersionInfoW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        version.VerQueryValueW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.UINT),
+        ]
+
+        size = version.GetFileVersionInfoSizeW(path, None)
+        if size:
+            data = ctypes.create_string_buffer(size)
+            if version.GetFileVersionInfoW(path, 0, size, data):
+                block = ctypes.c_void_p()
+                length = wintypes.UINT()
+                if version.VerQueryValueW(
+                    data,
+                    r"\VarFileInfo\Translation",
+                    ctypes.byref(block),
+                    ctypes.byref(length),
+                ) and length.value >= 4:
+                    codes = ctypes.cast(
+                        block, ctypes.POINTER(wintypes.WORD * 2)
+                    ).contents
+                    key = rf"\StringFileInfo\{codes[0]:04x}{codes[1]:04x}\FileDescription"
+                    text = ctypes.c_void_p()
+                    if version.VerQueryValueW(
+                        data, key, ctypes.byref(text), ctypes.byref(length)
+                    ) and text.value:
+                        # Read to the NUL: the reported length is not a reliable
+                        # character count and over-reads into the next entry.
+                        value = ctypes.wstring_at(text.value).strip()
+                        if value and value.isprintable() and len(value) <= 64:
+                            result = value
+    except Exception:
+        pass
+
+    _appname_by_exe[path] = result
     return result
 
 
-def activate_window(hwnd: int) -> None:
-    """Bring a window to the foreground reliably from a background hook process."""
-    if not w.user32.IsWindow(hwnd):
-        return
+def _exe_for_pid(pid: int) -> str:
+    if not pid:
+        return ""
+    cached = _exe_by_pid.get(pid)
+    if cached is not None:
+        return cached
+    path = w.process_image_path(pid)
+    _exe_by_pid[pid] = path
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Enumeration
+# ---------------------------------------------------------------------------
+
+
+def enumerate_windows(
+    self_hwnd: int | None = None,
+    *,
+    exclude_hwnds: Iterable[int] = (),
+    exclude_exes: Iterable[str] = (),
+    exclude_titles: Iterable[str] = (),
+    rank: Optional[Callable[[int], int]] = None,
+    minimized_last: bool = False,
+) -> list[AppWindow]:
+    exclude = {int(h) for h in exclude_hwnds if h}
+    if self_hwnd:
+        exclude.add(int(self_hwnd))
+    exclude.discard(0)
+
+    blocked_exes = {e.lower() for e in exclude_exes if e}
+    blocked_titles = [t.lower() for t in exclude_titles if t]
+
+    hwnds: list[int] = []
+
+    @w.WNDENUMPROC
+    def enum_proc(hwnd, _lparam):
+        if _is_alt_tab_candidate(int(hwnd), exclude):
+            hwnds.append(int(hwnd))
+        return True
+
+    w.user32.EnumWindows(enum_proc, 0)
+
+    result: list[AppWindow] = []
+    for hwnd in hwnds:
+        pid = wintypes.DWORD()
+        w.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        exe_path = _exe_for_pid(int(pid.value))
+        exe_name = os.path.basename(exe_path).lower()
+        if exe_name and exe_name in blocked_exes:
+            continue
+        title = _window_title(hwnd)
+        low_title = title.lower()
+        if any(pattern in low_title for pattern in blocked_titles):
+            continue
+        result.append(
+            AppWindow(
+                hwnd=hwnd,
+                title=title,
+                class_name=_class_name(hwnd),
+                pid=int(pid.value),
+                icon=_extract_icon(hwnd, exe_path),
+                exe_path=exe_path,
+                app_name=_file_description(exe_path),
+                minimized=bool(w.user32.IsIconic(hwnd)),
+                maximized=bool(w.user32.IsZoomed(hwnd)),
+            )
+        )
+
+    result = order_windows(result, hwnds, rank=rank, minimized_last=minimized_last)
+
+    prune_icon_cache(hwnds)
+    live_pids = {a.pid for a in result}
+    for pid in [p for p in _exe_by_pid if p not in live_pids]:
+        _exe_by_pid.pop(pid, None)  # PIDs get recycled; never trust a dead one
+    return result
+
+
+def order_windows(
+    apps: list[AppWindow],
+    discovery_order: Iterable[int] = (),
+    *,
+    rank: Optional[Callable[[int], int]] = None,
+    minimized_last: bool = False,
+) -> list[AppWindow]:
+    """Sort windows for display: most-recently-used first, minimised last.
+
+    ``rank`` comes from the foreground tracker and is authoritative; windows it
+    has never seen all share one large rank, so z-order (the order Windows
+    handed them to us) breaks those ties instead of leaving them arbitrary.
+    """
+    ordered = list(apps)
+    if rank is not None:
+        z_order = {hwnd: i for i, hwnd in enumerate(discovery_order)}
+        ordered.sort(key=lambda a: (rank(a.hwnd), z_order.get(a.hwnd, len(z_order))))
+    if minimized_last:
+        ordered.sort(key=lambda a: a.minimized)  # stable: keeps the order above
+    return ordered
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+
+def activate_window(hwnd: int) -> bool:
+    """Bring a window to the foreground reliably from a background process."""
+    if not hwnd or not w.user32.IsWindow(hwnd):
+        return False
 
     if w.user32.IsIconic(hwnd):
         w.user32.ShowWindow(hwnd, w.SW_RESTORE)
 
+    try:
+        w.user32.AllowSetForegroundWindow(w.ASFW_ANY)
+    except OSError:
+        pass
+
     fg = w.user32.GetForegroundWindow()
+    if fg == hwnd:
+        return True
+
     target_tid = w.user32.GetWindowThreadProcessId(hwnd, None)
     fg_tid = w.user32.GetWindowThreadProcessId(fg, None) if fg else 0
     cur_tid = w.kernel32.GetCurrentThreadId()
@@ -239,9 +524,35 @@ def activate_window(hwnd: int) -> None:
         if attached_fg:
             w.user32.AttachThreadInput(cur_tid, fg_tid, False)
 
+    if int(w.user32.GetForegroundWindow() or 0) == hwnd:
+        return True
+
+    # Last resort: the shell's own switcher path, which the foreground-lock
+    # rules explicitly permit.
+    try:
+        w.user32.SwitchToThisWindow(hwnd, True)
+    except OSError:
+        return False
+    return int(w.user32.GetForegroundWindow() or 0) == hwnd
+
+
+def close_window(hwnd: int) -> None:
+    if hwnd and w.user32.IsWindow(hwnd):
+        w.user32.PostMessageW(hwnd, w.WM_CLOSE, 0, 0)
+
+
+def minimize_window(hwnd: int) -> None:
+    if hwnd and w.user32.IsWindow(hwnd):
+        w.user32.ShowWindow(hwnd, w.SW_SHOWMINNOACTIVE)
+
 
 def foreground_hwnd() -> int:
     return int(w.user32.GetForegroundWindow() or 0)
+
+
+# ---------------------------------------------------------------------------
+# Thumbnails
+# ---------------------------------------------------------------------------
 
 
 def _bits_to_image(hdc_mem, hbmp, width: int, height: int) -> Optional[Image.Image]:
@@ -253,98 +564,86 @@ def _bits_to_image(hdc_mem, hbmp, width: int, height: int) -> Optional[Image.Ima
     bmi.bmiHeader.biBitCount = 32
     bmi.bmiHeader.biCompression = w.BI_RGB
 
-    buf_len = width * height * 4
-    buf = (ctypes.c_ubyte * buf_len)()
-    got = w.gdi32.GetDIBits(
+    buf = (ctypes.c_ubyte * (width * height * 4))()
+    if not w.gdi32.GetDIBits(
         hdc_mem, hbmp, 0, height, buf, ctypes.byref(bmi), w.DIB_RGB_COLORS
-    )
-    if not got:
+    ):
         return None
-    return Image.frombuffer(
-        "RGBA", (width, height), bytes(buf), "raw", "BGRA", 0, 1
-    ).convert("RGBA")
+    # The alpha byte of a compatible bitmap is undefined, so drop it entirely.
+    arr = np.frombuffer(bytes(buf), dtype=np.uint8).reshape(height, width, 4)
+    return Image.fromarray(np.ascontiguousarray(arr[..., 2::-1]), "RGB")
 
 
 def _is_blank_capture(img: Image.Image) -> bool:
-    """PrintWindow often 'succeeds' for minimized windows with a flat black/white frame."""
+    """PrintWindow often "succeeds" with a flat frame for windows that never painted."""
     try:
-        import numpy as np
-
         small = img.resize((48, 48), Image.Resampling.BILINEAR)
-        arr = np.array(small.convert("RGB"), dtype=np.int16)
-        # Near-uniform = blank
+        arr = np.asarray(small.convert("RGB"), dtype=np.int16)
         if arr.std() < 6:
             return True
-        # Almost entirely black or white
         mean = float(arr.mean())
-        if mean < 8 or mean > 247:
-            return True
-        return False
+        return mean < 8 or mean > 247
     except Exception:
         return False
+
+
+def _frame_inset(hwnd: int, rect: w.RECT) -> tuple[int, int, int, int]:
+    """Invisible resize border around a window, so previews are not padded."""
+    try:
+        bounds = w.RECT()
+        hr = w.dwmapi.DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(bounds),
+            ctypes.sizeof(bounds),
+        )
+        if hr != 0:
+            return (0, 0, 0, 0)
+        left = max(0, bounds.left - rect.left)
+        top = max(0, bounds.top - rect.top)
+        right = max(0, rect.right - bounds.right)
+        bottom = max(0, rect.bottom - bounds.bottom)
+        if left + right >= (rect.right - rect.left) or top + bottom >= (
+            rect.bottom - rect.top
+        ):
+            return (0, 0, 0, 0)
+        return (left, top, right, bottom)
+    except Exception:
+        return (0, 0, 0, 0)
 
 
 def _print_window_to_image(hwnd: int, src_w: int, src_h: int) -> Optional[Image.Image]:
     hdc_screen = w.user32.GetDC(0)
     if not hdc_screen:
         return None
+    hdc_mem = 0
+    full_bmp = 0
     try:
         hdc_mem = w.gdi32.CreateCompatibleDC(hdc_screen)
         full_bmp = w.gdi32.CreateCompatibleBitmap(hdc_screen, src_w, src_h)
-        if not full_bmp:
-            w.gdi32.DeleteDC(hdc_mem)
+        if not hdc_mem or not full_bmp:
             return None
         old = w.gdi32.SelectObject(hdc_mem, full_bmp)
 
         ok = w.user32.PrintWindow(hwnd, hdc_mem, w.PW_RENDERFULLCONTENT)
         if not ok:
             ok = w.user32.PrintWindow(hwnd, hdc_mem, 0)
-
         img = _bits_to_image(hdc_mem, full_bmp, src_w, src_h) if ok else None
 
         w.gdi32.SelectObject(hdc_mem, old)
-        w.gdi32.DeleteObject(full_bmp)
-        w.gdi32.DeleteDC(hdc_mem)
         if img is not None and _is_blank_capture(img):
             return None
         return img
     finally:
-        w.user32.ReleaseDC(0, hdc_screen)
-
-
-def _bitblt_window_to_image(hwnd: int, rect: w.RECT) -> Optional[Image.Image]:
-    src_w = rect.right - rect.left
-    src_h = rect.bottom - rect.top
-    hdc_screen = w.user32.GetDC(0)
-    if not hdc_screen:
-        return None
-    try:
-        hdc_mem = w.gdi32.CreateCompatibleDC(hdc_screen)
-        full_bmp = w.gdi32.CreateCompatibleBitmap(hdc_screen, src_w, src_h)
-        if not full_bmp:
+        if full_bmp:
+            w.gdi32.DeleteObject(full_bmp)
+        if hdc_mem:
             w.gdi32.DeleteDC(hdc_mem)
-            return None
-        old = w.gdi32.SelectObject(hdc_mem, full_bmp)
-        SRCCOPY = 0x00CC0020
-        ok = w.gdi32.BitBlt(
-            hdc_mem, 0, 0, src_w, src_h, hdc_screen, rect.left, rect.top, SRCCOPY
-        )
-        img = _bits_to_image(hdc_mem, full_bmp, src_w, src_h) if ok else None
-        w.gdi32.SelectObject(hdc_mem, old)
-        w.gdi32.DeleteObject(full_bmp)
-        w.gdi32.DeleteDC(hdc_mem)
-        if img is not None and _is_blank_capture(img):
-            return None
-        return img
-    finally:
         w.user32.ReleaseDC(0, hdc_screen)
 
 
 def _capture_minimized(hwnd: int) -> Optional[Image.Image]:
-    """
-    Minimized windows don't paint — briefly restore off-screen (no focus steal),
-    PrintWindow, then minimize again.
-    """
+    """Minimised windows never paint — restore them off-screen, grab, re-minimise."""
     placement = w.WINDOWPLACEMENT()
     placement.length = ctypes.sizeof(w.WINDOWPLACEMENT)
     if not w.user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
@@ -354,7 +653,6 @@ def _capture_minimized(hwnd: int) -> Optional[Image.Image]:
     src_w = max(8, normal.right - normal.left)
     src_h = max(8, normal.bottom - normal.top)
 
-    # Park off-screen so restore doesn't flash on the desktop.
     flags = (
         w.SWP_NOSIZE
         | w.SWP_NOZORDER
@@ -373,14 +671,12 @@ def _capture_minimized(hwnd: int) -> Optional[Image.Image]:
     if rw < 8 or rh < 8:
         rw, rh = src_w, src_h
 
-    # PrintWindow only — BitBlt of an off-screen window is empty/wrong.
     img = _print_window_to_image(hwnd, rw, rh)
 
     placement.length = ctypes.sizeof(w.WINDOWPLACEMENT)
     placement.showCmd = w.SW_SHOWMINIMIZED
     w.user32.SetWindowPlacement(hwnd, ctypes.byref(placement))
     w.user32.ShowWindow(hwnd, w.SW_SHOWMINNOACTIVE)
-
     return img
 
 
@@ -389,21 +685,19 @@ def capture_thumbnail(
     max_width: int = 480,
     max_height: int = 270,
     *,
-    allow_screen_grab: bool = False,
+    allow_minimized: bool = True,
 ) -> Optional[Image.Image]:
-    """Window preview for the switcher.
+    """Preview bitmap for a window, using the window's own pixels (PrintWindow).
 
-    Uses PrintWindow (the window's own pixels) — NOT a screen BitBlt — by
-    default. Screen BitBlt looks sharp but captures whatever is on top of the
-    window, including our Alt+Tab overlay (recursive preview bug).
+    A screen BitBlt would be sharper but captures whatever sits on top of the
+    window — including our own overlay.
     """
     if not hwnd or not w.user32.IsWindow(hwnd):
         return None
 
-    iconic = bool(w.user32.IsIconic(hwnd))
-    img: Optional[Image.Image] = None
-
-    if iconic:
+    if w.user32.IsIconic(hwnd):
+        if not allow_minimized:
+            return None
         img = _capture_minimized(hwnd)
     else:
         rect = w.RECT()
@@ -413,29 +707,26 @@ def capture_thumbnail(
         src_h = rect.bottom - rect.top
         if src_w < 8 or src_h < 8:
             return None
-
-        # Always PrintWindow first — true window contents.
         img = _print_window_to_image(hwnd, src_w, src_h)
-        # Screen grab only when the caller guarantees our overlay is hidden.
-        if img is None and allow_screen_grab:
-            img = _bitblt_window_to_image(hwnd, rect)
+        if img is not None:
+            left, top, right, bottom = _frame_inset(hwnd, rect)
+            if left or top or right or bottom:
+                img = img.crop((left, top, src_w - right, src_h - bottom))
 
     if img is None:
         return None
 
     src_w, src_h = img.size
-    capture_w = min(src_w, max(max_width * 2, max_width))
-    capture_h = min(src_h, max(max_height * 2, max_height))
-    fit = min(capture_w / src_w, capture_h / src_h, 1.0)
-    mid_w = max(1, int(src_w * fit))
-    mid_h = max(1, int(src_h * fit))
-
-    if img.size != (mid_w, mid_h):
-        img = img.resize((mid_w, mid_h), Image.Resampling.LANCZOS)
-
-    out_scale = min(max_width / mid_w, max_height / mid_h, 1.0)
-    if out_scale < 1.0:
-        dst_w = max(1, int(mid_w * out_scale))
-        dst_h = max(1, int(mid_h * out_scale))
-        img = img.resize((dst_w, dst_h), Image.Resampling.LANCZOS)
-    return img
+    fit = min(max_width / src_w, max_height / src_h, 1.0)
+    if fit < 1.0:
+        # Two-step downscale: REDUCE is far cheaper than LANCZOS for big factors.
+        step = max(1, int(1.0 / fit) // 2)
+        if step > 1:
+            img = img.reduce(step)
+            src_w, src_h = img.size
+            fit = min(max_width / src_w, max_height / src_h, 1.0)
+        img = img.resize(
+            (max(1, int(src_w * fit)), max(1, int(src_h * fit))),
+            Image.Resampling.LANCZOS,
+        )
+    return img.convert("RGBA")

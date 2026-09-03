@@ -25,33 +25,38 @@ class WheelLayout:
     inner_r: float
     outer_r: float
     slices: tuple[SliceGeom, ...]
+    first_edge: float  # angle of slice 0's leading (counter-clockwise) edge
+    sweep: float  # radians per slice
 
     def hit_test(self, x: float, y: float) -> int | None:
+        """Slice under a point, bounded to the ring itself (used for clicks)."""
+        return self._slice_at(x, y, self.inner_r * 0.5, self.outer_r * 1.1)
+
+    def aim(self, x: float, y: float) -> int | None:
+        """Slice the cursor *points at*, however far away it is.
+
+        A weapon wheel is a direction picker: once the cursor leaves the hub
+        dead zone, the angle alone decides the selection. Flicking the mouse
+        towards a slice selects it without having to land on the ring.
+        """
+        return self._slice_at(x, y, self.inner_r * 0.62, math.inf)
+
+    def _slice_at(self, x: float, y: float, min_r: float, max_r: float) -> int | None:
+        if not self.slices:
+            return None
         dx = x - self.cx
         dy = y - self.cy
         dist = math.hypot(dx, dy)
-        if dist < self.inner_r * 0.5 or dist > self.outer_r * 1.1:
+        if dist < min_r or dist > max_r:
             return None
 
-        # Screen → math angle (flip Y).
-        angle = math.atan2(-dy, dx) % (2 * math.pi)
-
-        for sl in self.slices:
-            if _angle_on_clockwise_arc(angle, sl.start_cw, sl.end_cw):
-                return sl.index
-        return None
-
-
-def _angle_on_clockwise_arc(angle: float, start: float, end: float) -> bool:
-    """True if angle lies on the half-open clockwise arc [start, end)."""
-    angle %= 2 * math.pi
-    start %= 2 * math.pi
-    end %= 2 * math.pi
-    if abs((start - end) % (2 * math.pi)) < 1e-9:
-        return True  # full circle
-    cw_to_angle = (start - angle) % (2 * math.pi)
-    cw_span = (start - end) % (2 * math.pi)
-    return cw_to_angle < cw_span
+        # Screen -> math angle (flip Y), then divide the clockwise offset by the
+        # slice width. Testing each arc's endpoints separately instead leaves
+        # one-ULP cracks on the seams where no slice matches at all, and with
+        # `aim` a crack is a dead ray reaching the edge of the screen.
+        angle = math.atan2(-dy, dx)
+        offset = (self.first_edge - angle) % (2 * math.pi)
+        return min(int(offset / self.sweep), len(self.slices) - 1)
 
 
 def build_layout(
@@ -62,18 +67,22 @@ def build_layout(
     inner_r: float,
 ) -> WheelLayout:
     if count <= 0:
-        return WheelLayout(cx, cy, inner_r, outer_r, tuple())
+        return WheelLayout(cx, cy, inner_r, outer_r, tuple(), math.pi / 2, 2 * math.pi)
 
     sweep = (2 * math.pi) / count
-    # First slice centered near the top, then clockwise (Tab advances clockwise).
+    # Slice 0 is *centered* on 12 o'clock, then they run clockwise (the
+    # direction Tab advances). Centering matters: the wheel opens with the
+    # cursor at the hub, so straight up has to be an unambiguous pick rather
+    # than the seam between the first and last app.
     top = math.pi / 2
+    edge = top + sweep / 2
     icon_r = (inner_r + outer_r) * 0.52
     slices: list[SliceGeom] = []
 
     for i in range(count):
-        start_cw = (top - i * sweep) % (2 * math.pi)
-        end_cw = (top - (i + 1) * sweep) % (2 * math.pi)
-        mid = (top - (i + 0.5) * sweep) % (2 * math.pi)
+        start_cw = (edge - i * sweep) % (2 * math.pi)
+        end_cw = (edge - (i + 1) * sweep) % (2 * math.pi)
+        mid = (top - i * sweep) % (2 * math.pi)
         ix = cx + math.cos(mid) * icon_r
         iy = cy - math.sin(mid) * icon_r
         slices.append(
@@ -87,7 +96,7 @@ def build_layout(
             )
         )
 
-    return WheelLayout(cx, cy, inner_r, outer_r, tuple(slices))
+    return WheelLayout(cx, cy, inner_r, outer_r, tuple(slices), edge, sweep)
 
 
 def pie_points(

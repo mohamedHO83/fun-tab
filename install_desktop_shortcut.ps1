@@ -14,7 +14,7 @@ $shortcut.TargetPath = $bat
 $shortcut.WorkingDirectory = $root
 $shortcut.IconLocation = "$ico,0"
 $shortcut.Description = "Fun Tab - GTA-style Alt+Tab wheel"
-$shortcut.WindowStyle = 7  # minimized — bat flashes less
+$shortcut.WindowStyle = 7  # minimized: the bat flashes less
 $shortcut.Save()
 
 Write-Host "Desktop shortcut created: $lnkPath"
