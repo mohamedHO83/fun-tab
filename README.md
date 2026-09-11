@@ -158,7 +158,7 @@ python -m fun_tab.preview --scene --out=assets/fun-tab-open.png
 
 `preview.py` renders the wheel and preview card to a PNG without installing the keyboard hook, which is the quickest way to iterate on the look. Its `ScenePreview` is what the settings window shows, and it shares the backdrop treatment with the overlay (`treat_plate`) so the two can't drift apart.
 
-Local probe shots (`live_open.png`, `probe_blur.png`, and the rest) stay gitignored on purpose: they are captures of the machine that ran the check, not something to publish.
+Live check and backdrop probe scripts write PNGs next to the repo. Those files are gitignored — do not commit them; they are captures of the machine that ran the check.
 
 ## Notes and caveats
 

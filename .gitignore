@@ -1,6 +1,9 @@
 __pycache__/
 *.py[cod]
 *.png
+live_*.png
+probe_*.png
+preview_wheel.png
 !assets/
 !assets/**
 .venv/
