@@ -10,3 +10,9 @@ build/
 *.egg-info/
 .idea/
 .vscode/
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.env.*
+*.json.checkbak

@@ -85,6 +85,16 @@ def test_valid_choices_survive_clamping():
         cfg = Config(backdrop=backdrop)
         cfg.clamp()
         assert cfg.backdrop == backdrop
+    for mode in ("auto", "always", "off"):
+        cfg = Config(game_compat=mode)
+        cfg.clamp()
+        assert cfg.game_compat == mode
+
+
+def test_unknown_game_compat_falls_back_to_auto():
+    cfg = Config(game_compat="stealth")
+    cfg.clamp()
+    assert cfg.game_compat == "auto"
 
 
 @pytest.mark.parametrize(
@@ -96,6 +106,27 @@ def test_retired_backdrop_names_migrate(old, new):
     cfg = Config(backdrop=old)
     cfg.clamp()
     assert cfg.backdrop == new
+
+
+@pytest.mark.parametrize("field", ["aim_needle", "aim_origin"])
+def test_the_aiming_helpers_are_on_by_default(field):
+    assert getattr(Config(), field) is True
+
+
+@pytest.mark.parametrize("field", ["aim_needle", "aim_origin"])
+def test_the_aiming_helpers_can_be_turned_off_in_the_file(tmp_path, field):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({field: False}), encoding="utf-8")
+    assert getattr(Config.load(path), field) is False
+
+
+def test_a_config_from_before_the_aiming_options_keeps_them_on(tmp_path):
+    """Upgrading must not silently switch a feature off."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"theme": "dark", "backdrop": "blur"}), encoding="utf-8")
+    cfg = Config.load(path)
+    assert cfg.aim_needle is True
+    assert cfg.aim_origin is True
 
 
 # -- colour helpers ---------------------------------------------------------

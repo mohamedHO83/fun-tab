@@ -154,8 +154,13 @@ def check_aiming(apps) -> None:
 
         picked = {r.split("=")[1] for r in results}
         print(f"aim from screen corner   {' '.join(results)}")
-        if len(picked) < 4:
-            raise SystemExit(f"flicks did not resolve to distinct slices: {results}")
+        # With three windows on screen a quarter-turn apart, two of the four
+        # directions share a slice by geometry, not by getting it wrong.
+        wanted = min(4, len(apps))
+        if len(picked) < wanted:
+            raise SystemExit(
+                f"flicks did not resolve to {wanted} distinct slices: {results}"
+            )
 
         # The needle should be up after a flick, and gone the moment a key is
         # used — otherwise it would point somewhere the selection is not.

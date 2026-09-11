@@ -68,6 +68,10 @@ class Config:
     capture_minimized: bool = True
     thumb_ttl: float = 4.0  # seconds a captured thumbnail is reused before refresh
 
+    # --- aiming -----------------------------------------------------------
+    aim_needle: bool = True  # the needle in the hub, showing the aim direction
+    aim_origin: bool = True  # a ring marking the point aiming is measured from
+
     # --- labels -----------------------------------------------------------
     show_counter: bool = True
     show_subtitle: bool = True
@@ -82,6 +86,23 @@ class Config:
     minimized_last: bool = False
     exclude_exes: list[str] = field(default_factory=list)
     exclude_titles: list[str] = field(default_factory=list)
+
+    # off     - always take over Alt+Tab
+    # always  - never take over Alt+Tab; open with Ctrl+Alt+Tab
+    # auto    - the same as always, but only while a game is in front
+    game_compat: str = "auto"
+    game_exes: list[str] = field(default_factory=list)  # extra names auto-mode treats as games
+
+    # How to open the wheel. Keyboard chords (`alt+tab`, `ctrl+shift+a`) or
+    # mouse side-buttons (`mouse4`, `ctrl+mouse5`). Game-compat leaves plain
+    # Alt+Tab to Windows; set a custom chord or mouse button for those games.
+    open_hotkey: str = "alt+tab"
+    # When True, the wheel stays up after the open shortcut is released.
+    # When False, releasing Alt (or the mouse button / key) commits, like Alt+Tab.
+    open_sticky: bool = False
+    # When True, Fun Tab uninstalls its input hooks while a game is in front.
+    # That is the strongest anti-cheat-friendly option short of quitting.
+    pause_in_games: bool = True
 
     # --- raw colour overrides (theme key -> "#RRGGBB" or [r,g,b,a]) -------
     colors: dict[str, Any] = field(default_factory=dict)
@@ -148,6 +169,11 @@ class Config:
         }.get(self.backdrop, self.backdrop)
         if self.backdrop not in ("blur", "dim", "none"):
             self.backdrop = "blur"
+        if self.game_compat not in ("auto", "always", "off"):
+            self.game_compat = "auto"
+        from .hotkey import parse_hotkey
+
+        self.open_hotkey = parse_hotkey(self.open_hotkey).text()
 
 
 def _coerce(annotation: Any, value: Any) -> Any:

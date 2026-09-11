@@ -86,6 +86,8 @@ def main() -> int:
             results["after_flick"] = app.overlay._selected
             results["aimed"] = ImageGrab.grab()
             results["needle"] = app.overlay._aim_angle
+            results["origin"] = app.overlay._origin_at
+            results["origin_live"] = app.overlay._origin_live
             w.user32.SetCursorPos(*here)
             time.sleep(0.12)
 
@@ -118,14 +120,6 @@ def main() -> int:
     idle: Image.Image = results["idle"]  # type: ignore[assignment]
     shot: Image.Image = results["open"]  # type: ignore[assignment]
     shot.save("live_open.png")
-    aimed = results.get("aimed")
-    if isinstance(aimed, Image.Image):
-        aimed.save("live_aim.png")
-        angle = results.get("needle")
-        if angle is None:
-            print("FAIL: flicking left no aim needle to draw")
-            return 1
-        print(f"aim needle at {math.degrees(float(angle)):.0f} deg (up is 90)")
     shot.resize((shot.width // 2, shot.height // 2), Image.Resampling.LANCZOS).save(
         "live_open_small.png"
     )
@@ -134,6 +128,7 @@ def main() -> int:
         f"opened={results['visible']} apps={results['apps']} "
         f"plate={results['plate']} selected={results['selected']}"
     )
+    print(f"aim origin at {results.get('origin')} live={results.get('origin_live')}")
     if not results["visible"]:
         print("FAIL: Alt+Tab did not open the wheel")
         return 1
@@ -145,6 +140,15 @@ def main() -> int:
         )
     else:
         print("flick up: only one window open, so aiming had nothing to move to")
+
+    aimed = results.get("aimed")
+    if isinstance(aimed, Image.Image):
+        aimed.save("live_aim.png")
+        angle = results.get("needle")
+        if angle is None:
+            print("FAIL: flicking left no aim needle to draw")
+            return 1
+        print(f"aim needle at {math.degrees(float(angle)):.0f} deg (up is 90)")
 
     # A corner of desktop well away from the wheel and the preview card.
     corner = (1500, 60, shot.width - 20, 520)

@@ -75,6 +75,48 @@ def _ease_out_cubic(t: float) -> float:
     return 1 - (1 - t) ** 3
 
 
+def treat_plate(plate: Image.Image, cfg: Config) -> Image.Image:
+    """Blur and darken a captured desktop plate as the backdrop settings ask.
+
+    Shared with the settings window so its preview is the same pixels the
+    overlay will show, rather than an approximation that drifts.
+    """
+    # "dim" is the same frozen plate with the blur skipped: cheaper and
+    # predictable. "blur" aims for a frosted/acrylic-ish look by combining
+    # a modest blur radius with a translucent tint blend.
+    amount = 0.0 if cfg.backdrop == "dim" else cfg.dim_blur
+
+    if amount > 0.01:
+        # Keep the blur radius smaller than the old implementation. The
+        # previous mapping made the blur feel "smudgy" instead of glass.
+        # Slightly larger blur radius to hide the low-resolution capture
+        # (dim_scale) when stretching the plate back up.
+        radius = max(1.0, min(plate.size) / 20.0) * amount
+        soft = plate.filter(ImageFilter.BoxBlur(radius))
+        plate = soft if amount > 0.99 else Image.blend(plate, soft, amount)
+
+    if cfg.dim_veil > 0:
+        if cfg.backdrop == "dim":
+            # Plain darken for the "dim" mode.
+            if plate.mode != "RGB":
+                plate = plate.convert("RGB")
+            factor = max(0.0, 1.0 - cfg.dim_veil / 255.0)
+            plate = plate.point([int(v * factor) for v in range(256)] * 3)
+        else:
+            # Acrylic-ish tint blend: translucent uniform veil rather than a
+            # multiplicative darken, so the backdrop still reads as colour.
+            theme = Theme.build(cfg)
+            if plate.mode != "RGBA":
+                plate = plate.convert("RGBA")
+            tint_rgb = theme.card_fill[:3]
+            tint = Image.new("RGBA", plate.size, tint_rgb + (255,))
+            # dim_veil is 0..220-ish; map it to a softer 0..~0.52 tint.
+            strength = max(0.0, min(1.0, cfg.dim_veil / 220.0)) * 0.52
+            plate = Image.blend(plate, tint, strength)
+
+    return plate.convert("RGBA")
+
+
 def _text_width(draw: ImageDraw.ImageDraw, text: str, font) -> float:
     if not text:
         return 0.0
@@ -243,11 +285,13 @@ class Overlay:
         self.hwnd = 0
         self._dim_hwnd = 0
         self._preview_hwnd = 0
+        self._origin_hwnd = 0
         self._wndprocs: list = []
 
         self._dim = LayeredSurface()
         self._wheel = LayeredSurface()
         self._preview = LayeredSurface()
+        self._origin = LayeredSurface()
         self._grabber = ScreenGrabber()  # UI thread: stretching the plate out
 
         # Backdrop capture. The worker gets its own grabber so a capture in
@@ -276,6 +320,7 @@ class Overlay:
 
         self._on_commit: Optional[Callable[[], None]] = None
         self._on_cancel: Optional[Callable[[], None]] = None
+        self.compat_active = False
 
         self._layers: Optional[WheelLayers] = None
         self._layer_cache: OrderedDict[tuple, WheelLayers] = OrderedDict()
@@ -315,6 +360,14 @@ class Overlay:
         # moment a key is pressed.
         self._aim_angle: Optional[float] = None
         self._written_aim: Optional[float] = None
+        # The pivot marker. Kept separately from `_mouse_anchor` because it
+        # stays put, greyed out, while the keyboard is driving — the anchor
+        # itself is cleared then, and a marker that vanished on every keypress
+        # would defeat the point of showing where aiming starts from.
+        self._origin_at: Optional[tuple[int, int]] = None
+        self._origin_live = False
+        self._origin_shown: tuple = ()
+        self._origin_cache: dict[tuple, Image.Image] = {}
 
         self._apply_metrics(96)
 
@@ -358,6 +411,7 @@ class Overlay:
         self._register(hinstance, "FunTabDimClass", self._make_passive_proc())
         self._register(hinstance, "FunTabWheelClass", self._make_wheel_proc())
         self._register(hinstance, "FunTabPreviewClass", self._make_passive_proc())
+        self._register(hinstance, "FunTabOriginClass", self._make_passive_proc())
 
         common_ex = (
             w.WS_EX_LAYERED | w.WS_EX_TOPMOST | w.WS_EX_TOOLWINDOW | w.WS_EX_NOACTIVATE
@@ -383,18 +437,20 @@ class Overlay:
         self._dim_hwnd = make("FunTabDimClass", "Fun Tab Backdrop")
         self.hwnd = make("FunTabWheelClass", "Fun Tab")
         self._preview_hwnd = make("FunTabPreviewClass", "Fun Tab Preview")
-        if not (self._dim_hwnd and self.hwnd and self._preview_hwnd):
+        self._origin_hwnd = make("FunTabOriginClass", "Fun Tab Origin")
+        if not (self._dim_hwnd and self.hwnd and self._preview_hwnd and self._origin_hwnd):
             raise OSError("Failed to create overlay windows")
 
         self._dim.hwnd = self._dim_hwnd
         self._wheel.hwnd = self.hwnd
         self._preview.hwnd = self._preview_hwnd
+        self._origin.hwnd = self._origin_hwnd
         self._worker.start()
         return self.hwnd
 
     def destroy(self) -> None:
         self._worker.stop()
-        for surface in (self._dim, self._wheel, self._preview):
+        for surface in (self._dim, self._wheel, self._preview, self._origin):
             surface.destroy()
         thread = self._capture_thread
         if thread is not None:
@@ -402,8 +458,8 @@ class Overlay:
         self._grabber.destroy()
         self._capture_grabber.destroy()
 
-    def own_hwnds(self) -> tuple[int, int, int]:
-        return (self._dim_hwnd, self.hwnd, self._preview_hwnd)
+    def own_hwnds(self) -> tuple[int, ...]:
+        return (self._dim_hwnd, self.hwnd, self._preview_hwnd, self._origin_hwnd)
 
     def apply_config(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -420,6 +476,8 @@ class Overlay:
         self._card_cache.clear()
         self._chrome_cache.clear()
         self._placeholder_cache.clear()
+        self._origin_cache.clear()
+        self._origin_shown = ()
         self._thumbs.clear()
         self._thumb_at.clear()
         self._thumb_stamp.clear()
@@ -570,6 +628,7 @@ class Overlay:
         self.margin = int(round(30 * scale))
         self.label_h = int(round((96 if cfg.show_hints else 92) * scale))
         self._mouse_slop = max(3, int(round(7 * scale)))
+        self._origin_size = max(12, int(round(26 * scale)) // 2 * 2)  # even, so it centres
 
         self.canvas_w = self.outer_r * 2 + self.margin * 2
         self.canvas_h = self.margin + self.outer_r * 2 + self.label_h
@@ -667,6 +726,9 @@ class Overlay:
         w.user32.GetCursorPos(ctypes.byref(point))
         self._mouse_anchor = (int(point.x), int(point.y))
         self._last_cursor = self._mouse_anchor
+        self._origin_at = self._mouse_anchor
+        self._origin_live = True
+        self._origin_shown = ()  # the window was hidden, so re-present regardless
 
         # The backdrop is sized explicitly because blur mode has no
         # UpdateLayeredWindow call to place it; the wheel and card were already
@@ -686,6 +748,11 @@ class Overlay:
                 # idles, so the wheel never appears over a bare desktop.
                 w.user32.UpdateWindow(self._dim_hwnd)
 
+        # Ordered deliberately: each SetWindowPos raises that window to the top
+        # of the topmost band, so the marker ends up over the backdrop but
+        # under the wheel, where it cannot cover a slice.
+        self._present_origin()
+
         flags = w.SWP_SHOWWINDOW | w.SWP_NOACTIVATE | w.SWP_NOMOVE | w.SWP_NOSIZE
         if self.cfg.preview_enabled:
             w.user32.SetWindowPos(self._preview_hwnd, w.HWND_TOPMOST, 0, 0, 0, 0, flags)
@@ -700,7 +767,7 @@ class Overlay:
         self._sticky = False
         self._worker.new_generation()
         flags = w.SWP_HIDEWINDOW | w.SWP_NOMOVE | w.SWP_NOSIZE | w.SWP_NOACTIVATE
-        for hwnd in (self.hwnd, self._preview_hwnd, self._dim_hwnd):
+        for hwnd in (self.hwnd, self._preview_hwnd, self._origin_hwnd, self._dim_hwnd):
             w.user32.SetWindowPos(hwnd, w.HWND_TOPMOST, 0, 0, 0, 0, flags)
         self._apps = []
         self._all_apps = []
@@ -708,6 +775,9 @@ class Overlay:
         self._mouse_anchor = None
         self._last_cursor = None
         self._aim_angle = None
+        self._origin_at = None
+        self._origin_live = False
+        self._origin_shown = ()
         self._card_key = ()
         with self._pending_lock:
             self._pending.clear()
@@ -933,6 +1003,7 @@ class Overlay:
         self._mouse_anchor = None
         self._last_cursor = None
         self._set_aim_angle(None)
+        self._set_origin(self._origin_at, live=False)
 
     def _poll_cursor(self) -> None:
         """Read the cursor once a frame.
@@ -955,6 +1026,7 @@ class Overlay:
             return
         if self._mouse_anchor is None:
             self._mouse_anchor = pos  # first sighting since the keyboard spoke
+            self._set_origin(pos, live=True)
             return
 
         dx = pos[0] - self._mouse_anchor[0]
@@ -981,8 +1053,96 @@ class Overlay:
         if hit is not None and hit != self._selected:
             self.select(hit, from_mouse=True)
 
+    # -- origin marker -----------------------------------------------------
+
+    def _origin_plate(self, live: bool) -> Image.Image:
+        """A ring marking the pivot, hollow so it never hides what's under it."""
+        key = (self._metrics_signature(), self._theme_rev, live)
+        cached = self._origin_cache.get(key)
+        if cached is not None:
+            return cached
+
+        ss = RENDER_SCALE
+        size = self._origin_size
+        img = Image.new("RGBA", (size * ss, size * ss), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        mid = size * ss / 2
+        radius = mid - 3 * self.s * ss
+        ring = max(1.5, 2.0 * self.s) * ss
+        theme = self.theme
+        strength = 1.0 if live else 0.45
+
+        # Dark ring just outside the bright one: the marker lands on unknown
+        # wallpaper, and one colour alone disappears against half of it.
+        draw.ellipse(
+            (mid - radius, mid - radius, mid + radius, mid + radius),
+            outline=alpha(theme.shadow, int(150 * strength)),
+            width=int(ring + 2 * self.s * ss),
+        )
+        draw.ellipse(
+            (mid - radius, mid - radius, mid + radius, mid + radius),
+            outline=alpha(theme.accent, int(240 * strength)),
+            width=int(ring),
+        )
+        dot = max(1.0, 1.6 * self.s) * ss
+        draw.ellipse(
+            (mid - dot, mid - dot, mid + dot, mid + dot),
+            fill=alpha(theme.accent, int(230 * strength)),
+        )
+
+        plate = img.resize((size, size), Image.Resampling.LANCZOS)
+        _trim(self._origin_cache, 8)
+        self._origin_cache[key] = plate
+        return plate
+
+    def _set_origin(self, at: Optional[tuple[int, int]], live: bool) -> None:
+        self._origin_at = at
+        self._origin_live = live
+        if self._visible:
+            self._present_origin()
+
+    def _present_origin(self) -> None:
+        """Move the marker window to the pivot, or hide it if there is nothing to mark."""
+        if not self._origin_hwnd:
+            return
+        at = self._origin_at if self.cfg.aim_origin else None
+        wanted = (at, self._origin_live, self._metrics_signature(), self._theme_rev)
+        if wanted == self._origin_shown:
+            return
+        self._origin_shown = wanted
+
+        if at is None:
+            w.user32.SetWindowPos(
+                self._origin_hwnd,
+                w.HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                w.SWP_HIDEWINDOW | w.SWP_NOMOVE | w.SWP_NOSIZE | w.SWP_NOACTIVATE,
+            )
+            return
+
+        size = self._origin_size
+        if not self._origin.ensure(size, size):
+            return
+        self._origin.paint(
+            self._origin_plate(self._origin_live), at[0] - size // 2, at[1] - size // 2
+        )
+        w.user32.SetWindowPos(
+            self._origin_hwnd,
+            w.HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            w.SWP_SHOWWINDOW | w.SWP_NOMOVE | w.SWP_NOSIZE | w.SWP_NOACTIVATE,
+        )
+
     def _set_aim_angle(self, angle: Optional[float]) -> None:
         """Quantised so a pixel of jitter does not repaint the wheel."""
+        if angle is not None and not self.cfg.aim_needle:
+            angle = None  # switched off: aiming still works, it just isn't drawn
         if angle is not None:
             angle = round(angle / AIM_STEP) * AIM_STEP
         if angle != self._aim_angle:
@@ -1003,12 +1163,12 @@ class Overlay:
             self._render(now)
 
     def alt_released_while_open(self) -> bool:
-        """Safety valve: never leave the wheel stuck up if an event was missed."""
+        """Deprecated safety valve — the app now uses hook.hold_released()."""
         if not self._visible or self._sticky:
             return False
         if time.perf_counter() - self._shown_at < 0.25:
             return False
-        return not (w.user32.GetAsyncKeyState(w.VK_MENU) & 0x8000)
+        return False
 
     def _animating(self, now: float) -> bool:
         if now - self._shown_at < self.cfg.appear_duration:
@@ -1517,6 +1677,8 @@ class Overlay:
             app.maximized,
             self._query,
             self._query_matched,
+            self.compat_active,
+            self.cfg.open_hotkey,
         )
         cached = self._label_cache.get(key)
         if cached is not None:
@@ -1568,7 +1730,9 @@ class Overlay:
                 draw, _ellipsize(draw, text, hint_font, max_width), centre, y, hint_font, colour
             )
         elif self.cfg.show_hints:
-            hint = "type to search · 1-9 jump · Del close · Esc cancel"
+            from .hotkey import parse_hotkey
+
+            hint = f"{parse_hotkey(self.cfg.open_hotkey).label()} · type to search · Esc cancel"
             _centered(
                 draw,
                 _ellipsize(draw, hint, hint_font, max_width),
@@ -1644,20 +1808,7 @@ class Overlay:
             if plate is None:
                 return None
 
-            # "dim" is the same frozen plate with the blur skipped, which
-            # costs a fraction of a translucent screen-sized layered window.
-            amount = 0.0 if cfg.backdrop == "dim" else cfg.dim_blur
-            if amount > 0.01:
-                # Blurring at 1/6 scale means a small radius covers a lot of
-                # screen, and BoxBlur is ~2.5x faster than Gaussian; neither
-                # difference survives being stretched back up.
-                radius = max(1.5, min(small_w, small_h) / 14.0) * amount
-                soft = plate.filter(ImageFilter.BoxBlur(radius))
-                plate = soft if amount > 0.99 else Image.blend(plate, soft, amount)
-            if cfg.dim_veil > 0:
-                factor = max(0.0, 1.0 - cfg.dim_veil / 255.0)
-                plate = plate.point([int(v * factor) for v in range(256)] * 3)
-            plate = plate.convert("RGBA")
+            plate = treat_plate(plate, cfg)
 
         with self._plate_lock:
             self._plate = plate

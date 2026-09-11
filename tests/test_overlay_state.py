@@ -369,6 +369,10 @@ def aiming(selected: int = 0, at=(1500, 900), **overrides) -> tuple[Overlay, Poi
     o._wheel_origin = (960 - o.canvas_w // 2, 540 - o.canvas_h // 2)
     o._mouse_anchor = at
     o._last_cursor = at
+    # What `show` records: the cursor's position at open is both the anchor to
+    # aim from and the spot the marker sits on.
+    o._origin_at = at
+    o._origin_live = True
     return o, Pointer(o, at)
 
 
@@ -489,6 +493,16 @@ def test_the_needle_points_where_the_cursor_aims():
     assert o._aim_angle == pytest.approx(0.0, abs=math.radians(2))
 
 
+def test_the_needle_can_be_switched_off_without_breaking_aiming():
+    o, pointer = aiming(selected=0, aim_needle=False)
+    pointer.flick(0, -200)
+    assert o._aim_angle is None, "the needle was switched off"
+    assert o._selected == 0, "up is slice 0, so aiming itself still worked"
+    pointer.flick(200, 200)
+    assert o._selected != 0, "flicking right still moves the selection"
+    assert o._aim_angle is None
+
+
 def test_the_needle_appears_only_while_aiming():
     o, pointer = aiming(selected=0)
     assert o._aim_angle is None, "nothing aimed yet at open"
@@ -541,7 +555,9 @@ def test_the_needle_fits_inside_the_box_that_gets_patched():
     for deg in range(0, 360, 7):
         marked = frame.copy()
         o._draw_needle(marked, math.radians(deg))
-        touched = ImageChops.difference(marked, frame).getbbox()
+        # alpha_only is Pillow's default and would only notice the needle
+        # where it changed opacity, not where it changed colour.
+        touched = ImageChops.difference(marked, frame).getbbox(alpha_only=False)
         assert touched is not None, f"nothing drawn at {deg} degrees"
         assert x0 <= touched[0] and y0 <= touched[1], (deg, touched)
         assert touched[2] <= x1 and touched[3] <= y1, (deg, touched)
@@ -564,6 +580,77 @@ def test_patching_the_needle_matches_a_full_repaint():
     # And clearing it must restore the untouched frame.
     o._patch_needle(frame, None)
     assert _dib_bytes(o._wheel) == frame.tobytes("raw", "BGRa")
+
+
+# -- origin marker ----------------------------------------------------------
+
+
+def test_the_origin_marks_where_the_wheel_opened():
+    o, _ = aiming(selected=0, at=(1700, 950))
+    assert o._origin_at == (1700, 950)
+    assert o._origin_live is True
+
+
+def test_the_origin_stays_put_but_dims_when_the_keyboard_takes_over():
+    """It answers "where is my aim measured from", which a keypress must not erase."""
+    o, _ = aiming(selected=0, at=(1700, 950))
+    o.cycle(1)
+    assert o._origin_at == (1700, 950), "the marker must not vanish on a keypress"
+    assert o._origin_live is False
+    assert o._mouse_anchor is None, "but the anchor itself is released"
+
+
+def test_the_origin_moves_to_wherever_the_mouse_takes_over_again():
+    o, pointer = aiming(selected=0, at=(1700, 950))
+    o.cycle(1)  # keyboard drives, anchor released
+    pointer.move_to((400, 300))  # mouse speaks again: re-anchors here
+    assert o._origin_at == (400, 300)
+    assert o._origin_live is True
+
+
+def test_the_origin_is_forgotten_when_the_wheel_closes():
+    o, _ = aiming(selected=0)
+    o.hide()
+    assert o._origin_at is None
+    assert o._origin_live is False
+
+
+def test_the_origin_marker_is_drawn_hollow():
+    """It lands on unknown wallpaper, so the middle has to stay see-through."""
+    o = wheel()
+    plate = o._origin_plate(True)
+    assert plate.size == (o._origin_size, o._origin_size)
+    corner = plate.getpixel((0, 0))
+    assert corner[3] == 0, "the marker must not be a filled square"
+
+    ring = max(plate.getpixel((x, plate.height // 2))[3] for x in range(plate.width))
+    assert ring > 200, "the ring itself should be close to opaque"
+
+
+def test_a_dimmed_origin_marker_is_fainter_than_a_live_one():
+    o = wheel()
+    live = max(p[3] for p in o._origin_plate(True).getdata())
+    idle = max(p[3] for p in o._origin_plate(False).getdata())
+    assert idle < live
+
+
+def test_switching_the_origin_marker_off_hides_it():
+    off, _ = aiming(selected=0, at=(1700, 950), aim_origin=False)
+    on, _ = aiming(selected=0, at=(1700, 950))
+    for o in (off, on):
+        o._origin_hwnd = 1  # no real window; presenting still records its decision
+        o._origin_shown = ()
+        o._present_origin()
+
+    assert off._origin_shown[0] is None, "nothing should be positioned to show"
+    assert on._origin_shown[0] == (1700, 950)
+
+
+def test_the_marker_window_is_excluded_from_the_window_list():
+    """Otherwise the wheel would offer you one of its own windows."""
+    o = wheel()
+    o._dim_hwnd, o.hwnd, o._preview_hwnd, o._origin_hwnd = 11, 12, 13, 14
+    assert set(o.own_hwnds()) == {11, 12, 13, 14}
 
 
 # -- backdrop ---------------------------------------------------------------

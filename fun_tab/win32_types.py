@@ -13,6 +13,7 @@ dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 
 # Constants
 WH_KEYBOARD_LL = 13
+WH_MOUSE_LL = 14
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
@@ -29,6 +30,7 @@ WM_MBUTTONUP = 0x0208
 WM_MOUSEWHEEL = 0x020A
 WM_XBUTTONDOWN = 0x020B
 WM_XBUTTONUP = 0x020C
+WM_XBUTTONDBLCLK = 0x020D
 WM_HOTKEY = 0x0312
 WM_NULL = 0x0000
 WM_GETICON = 0x007F
@@ -65,6 +67,14 @@ VK_RCONTROL = 0xA3
 VK_LMENU = 0xA4
 VK_RMENU = 0xA5
 VK_OEM_3 = 0xC0  # backtick / grave
+VK_XBUTTON1 = 0x05
+VK_XBUTTON2 = 0x06
+
+XBUTTON1 = 0x0001
+XBUTTON2 = 0x0002
+LLMHF_INJECTED = 0x00000001
+LLKHF_ALTDOWN = 0x20
+LLKHF_UP = 0x80
 
 ICON_SMALL = 0
 ICON_BIG = 1
@@ -131,6 +141,10 @@ HOOKPROC = ctypes.WINFUNCTYPE(
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [
         ("vkCode", wintypes.DWORD),
@@ -141,8 +155,14 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt", POINT),
+        ("mouseData", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
 
 
 class SIZE(ctypes.Structure):
@@ -507,6 +527,9 @@ user32.SetWindowLongW.restype = wintypes.LONG
 user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
 user32.GetShellWindow.restype = wintypes.HWND
+# Used to raise an already-open settings window instead of starting a second.
+user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.FindWindowW.restype = wintypes.HWND
 user32.SwitchToThisWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
 user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
 user32.AllowSetForegroundWindow.restype = wintypes.BOOL

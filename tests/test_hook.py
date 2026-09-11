@@ -38,7 +38,7 @@ class Keyboard:
         info.vkCode = vk
         info.flags = w.LLKHF_ALTDOWN if alt_flag else 0
         message = w.WM_KEYUP if up else w.WM_KEYDOWN
-        return self.hook._handle(message, info)
+        return self.hook._handle_keyboard(message, info)
 
     def release(self, vk: int) -> bool:
         return self.press(vk, up=True)
@@ -108,6 +108,140 @@ def test_ctrl_alt_tab_opens_sticky():
     assert kb.actions() == [(hook_mod.OPEN, {"sticky": True, "reverse": False})]
 
 
+def test_compat_leaves_plain_alt_tab_alone():
+    kb = Keyboard()
+    kb.hook.compat_active = True
+    kb.alt = True
+    assert kb.press(w.VK_TAB) is False
+    assert kb.actions() == []
+
+
+def test_compat_opens_on_ctrl_alt_tab_and_stays_sticky():
+    kb = Keyboard()
+    kb.hook.compat_active = True
+    kb.hook.set_open_hotkey("alt+tab")
+    kb.alt = True
+    kb.ctrl = True
+    assert kb.press(w.VK_TAB) is True
+    assert kb.actions() == [(hook_mod.OPEN, {"sticky": True, "reverse": False})]
+
+
+def test_custom_mouse_hotkey_opens_from_the_mouse_hook():
+    kb = Keyboard()
+    kb.hook.set_open_hotkey("mouse4")
+    kb.hook.open_sticky = False
+    info = w.MSLLHOOKSTRUCT()
+    info.mouseData = 0x00010000  # XBUTTON1 in the high word
+    assert kb.hook._handle_mouse(w.WM_XBUTTONDOWN, info) is True
+    actions = kb.actions()
+    assert actions[0][0] == hook_mod.PREPARE
+    assert actions[1] == (hook_mod.OPEN, {"sticky": False, "reverse": False})
+
+
+def test_mouse_open_can_be_sticky():
+    kb = Keyboard()
+    kb.hook.set_open_hotkey("mouse4")
+    kb.hook.open_sticky = True
+    info = w.MSLLHOOKSTRUCT()
+    info.mouseData = 0x00010000
+    kb.hook._handle_mouse(w.WM_XBUTTONDOWN, info)
+    assert kb.actions()[1] == (hook_mod.OPEN, {"sticky": True, "reverse": False})
+
+
+def test_releasing_mouse_commits_when_not_sticky():
+    kb = Keyboard(opened=True, sticky=False)
+    kb.hook.set_open_hotkey("mouse4")
+    kb.hook.open_sticky = False
+    kb.hook._arm_hold(kb.hook.open_hotkey)
+    info = w.MSLLHOOKSTRUCT()
+    info.mouseData = 0x00010000
+    assert kb.hook._handle_mouse(w.WM_XBUTTONUP, info) is True
+    assert kb.kinds() == [hook_mod.COMMIT]
+
+
+def test_custom_keyboard_hotkey_replaces_alt_tab():
+    kb = Keyboard()
+    kb.hook.set_open_hotkey("ctrl+shift+a")
+    kb.hook.open_sticky = True
+    kb.alt = True
+    assert kb.press(w.VK_TAB) is False, "plain Alt+Tab is no longer ours"
+    kb.alt = False
+    kb.ctrl = True
+    kb.shift = True
+    assert kb.press(ord("A")) is True
+    assert kb.actions() == [(hook_mod.OPEN, {"sticky": True, "reverse": False})]
+
+
+def test_modifier_chord_holds_open_until_a_modifier_lifts():
+    """Ctrl+Shift+U must not die because Alt was never held."""
+    kb = Keyboard()
+    kb.hook.set_open_hotkey("ctrl+shift+u")
+    kb.hook.open_sticky = False
+    kb.ctrl = True
+    kb.shift = True
+    assert kb.press(ord("U")) is True
+    assert kb.actions()[0] == (hook_mod.OPEN, {"sticky": False, "reverse": False})
+    assert kb.hook._hold_kind == "mods"
+    assert kb.hook._hold_mods == frozenset({"ctrl", "shift"})
+
+    # Releasing U alone must not commit (Tab can lift in classic Alt+Tab).
+    kb.opened = True
+    assert kb.release(ord("U")) is False
+    assert kb.kinds() == []
+
+    # Releasing Ctrl commits.
+    kb.ctrl = False
+    assert kb.release(w.VK_LCONTROL) is True
+    assert kb.kinds() == [hook_mod.COMMIT]
+
+
+def test_hold_released_safety_valve_ignores_missing_alt_on_custom_chords():
+    kb = Keyboard(opened=True, sticky=False)
+    kb.hook.set_open_hotkey("ctrl+shift+u")
+    kb.hook.open_sticky = False
+    kb.hook._arm_hold(kb.hook.open_hotkey)
+    kb.ctrl = True
+    kb.shift = True
+    # Alt is not part of the chord — its absence must not look like a release.
+    kb.alt = False
+    assert kb.hook.hold_released() is False
+    kb.ctrl = False
+    assert kb.hook.hold_released() is True
+
+
+def test_compat_shift_ctrl_alt_tab_opens_backwards():
+    kb = Keyboard()
+    kb.hook.compat_active = True
+    kb.alt = True
+    kb.ctrl = True
+    kb.shift = True
+    kb.press(w.VK_TAB)
+    assert kb.actions() == [(hook_mod.OPEN, {"sticky": True, "reverse": True})]
+
+
+def test_compat_does_not_prepare_on_alt_alone():
+    kb = Keyboard()
+    kb.hook.compat_active = True
+    assert kb.press(w.VK_LMENU) is False
+    assert kb.kinds() == []
+
+
+def test_compat_prepares_once_ctrl_joins_alt():
+    kb = Keyboard()
+    kb.hook.compat_active = True
+    kb.alt = True
+    kb.press(w.VK_LCONTROL)
+    assert kb.kinds() == [hook_mod.PREPARE]
+
+
+def test_compat_leaves_alt_backtick_alone():
+    kb = Keyboard()
+    kb.hook.compat_active = True
+    kb.alt = True
+    assert kb.press(w.VK_OEM_3) is False
+    assert kb.actions() == []
+
+
 def test_alt_backtick_opens_the_current_app_only():
     kb = Keyboard()
     kb.alt = True
@@ -128,6 +262,7 @@ def test_alt_down_is_learned_from_the_event_flag():
 
 def test_releasing_alt_commits():
     kb = Keyboard(opened=True)
+    kb.hook._arm_hold(kb.hook.open_hotkey)  # classic alt+tab hold
     assert kb.release(w.VK_LMENU) is False, "Alt-up must pass through"
     assert kb.kinds() == [hook_mod.COMMIT]
 

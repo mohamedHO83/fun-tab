@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import sys
 import threading
+import time
 
 from . import autostart, hook as hook_actions
 from . import win32_types as w
@@ -20,6 +22,21 @@ from .windows_enum import (
     foreground_hwnd,
     minimize_window,
 )
+
+
+def _config_stamp(path=None) -> tuple:
+    """A fingerprint of the settings file, or `()` if it isn't there.
+
+    Hashes the contents rather than trusting the timestamp: Windows only moves
+    file times on about a 16ms tick, so two quick saves of a same-sized file
+    can share one and the second edit would never be noticed. It also means
+    re-saving without changing anything costs nothing.
+    """
+    try:
+        data = (path or config_path()).read_bytes()
+    except OSError:
+        return ()
+    return (len(data), hashlib.blake2b(data, digest_size=16).digest())
 
 
 def _hide_console() -> None:
@@ -41,6 +58,14 @@ class FunTabApp:
         self._tray = None
         self._running = True
         self._reload_requested = False
+        self._settings_proc = None
+        self._config_stamp = _config_stamp()
+        # After leaving a game, stay out of the way until Alt is fully released
+        # (and a short beat after). Otherwise Windows Alt+Tab is still in
+        # progress when we re-arm and the next Tab opens Fun Tab by mistake.
+        self._compat_latched = False
+        self._paused_for_game = False
+        self._resume_hooks_at = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -80,11 +105,139 @@ class FunTabApp:
         self.hook.search_enabled = self.cfg.search_enabled
         self.hook.digit_jump = self.cfg.digit_jump
         self.hook.close_key_enabled = self.cfg.close_key_enabled
+        self.hook.set_open_hotkey(self.cfg.open_hotkey)
+        self.hook.open_sticky = bool(self.cfg.open_sticky)
+        self._refresh_compat()
+
+    def _alt_held(self) -> bool:
+        return bool(w.user32.GetAsyncKeyState(w.VK_MENU) & 0x8000)
+
+    def _refresh_compat(self) -> None:
+        """Turn game-compat on or off, and optionally pause hooks in games.
+
+        Leaving a game mid Alt+Tab must not re-arm Fun Tab on the next Tab:
+        Windows still owns that gesture until Alt comes up.
+        """
+        in_game = False
+        in_switcher = False
+        if not self.overlay.visible:
+            from .game_detect import foreground_is_task_switcher, foreground_looks_like_a_game
+
+            try:
+                in_game = foreground_looks_like_a_game(self.cfg.game_exes)
+            except Exception:
+                in_game = False
+            try:
+                in_switcher = foreground_is_task_switcher()
+            except Exception:
+                in_switcher = False
+
+        leaving_game = self._paused_for_game or self._compat_latched
+        transitional = in_switcher or (leaving_game and self._alt_held())
+
+        mode = self.cfg.game_compat
+        if mode == "always":
+            active = True
+            self._compat_latched = False
+        elif mode == "off":
+            active = False
+            self._compat_latched = False
+        elif self.overlay.visible:
+            active = self.hook.compat_active
+        elif in_game:
+            active = True
+            self._compat_latched = True
+        elif transitional:
+            # Windows Alt+Tab (or Alt still down after leaving the game).
+            active = True
+        else:
+            active = False
+            self._compat_latched = False
+
+        self.hook.compat_active = active
+        self.overlay.compat_active = active
+
+        want_pause = bool(self.cfg.pause_in_games) and not self.overlay.visible
+        if want_pause and (in_game or transitional):
+            if self.hook.installed:
+                self.cancel()
+                self.hook.uninstall()
+            if in_game:
+                self._paused_for_game = True
+            # Stay paused through the Windows switcher / Alt-hold; resume later.
+            self._resume_hooks_at = 0.0
+            return
+
+        if self._paused_for_game and not in_game and not transitional:
+            # Just cleared the game + Alt-up + switcher gone: brief grace so a
+            # quick second Alt+Tab does not race the reinstall.
+            if self._resume_hooks_at <= 0.0:
+                self._resume_hooks_at = time.perf_counter() + 0.8
+            if time.perf_counter() < self._resume_hooks_at:
+                return
+            self._paused_for_game = False
+            self._resume_hooks_at = 0.0
+
+        if want_pause and self._paused_for_game:
+            return  # still waiting on grace / Alt
+
+        if not self.hook.installed and not (want_pause and in_game):
+            try:
+                self.hook.install()
+            except OSError:
+                pass
+            self._paused_for_game = False
+            self._resume_hooks_at = 0.0
 
     def reload_config(self) -> None:
         self.cfg = Config.load()
         self._apply_hook_settings()
         self.overlay.apply_config(self.cfg)
+        # Loading rewrites the file if it was unreadable, so re-stamp after
+        # rather than before, or that write would look like another edit.
+        self._config_stamp = _config_stamp()
+
+    def _config_file_edited(self) -> bool:
+        """Whether config.json has changed since we last looked.
+
+        Saving from the settings window is just a file write, so watching the
+        file is all the coupling the two processes need — and it means a
+        hand-edit applies on its own too.
+        """
+        stamp = _config_stamp()
+        if stamp == self._config_stamp:
+            return False
+        self._config_stamp = stamp
+        return True
+
+    def open_settings_ui(self) -> None:
+        """Launch the settings window as its own process.
+
+        Out of process because Tk wants to own a thread's message loop and
+        ours belongs to the keyboard hook.
+        """
+        import subprocess
+        from pathlib import Path
+
+        from .settings_ui import WINDOW_TITLE
+
+        existing = w.user32.FindWindowW(None, WINDOW_TITLE)
+        if existing:
+            w.user32.SetForegroundWindow(existing)
+            return
+        if self._settings_proc is not None and self._settings_proc.poll() is None:
+            return  # starting up, window not there yet
+
+        exe = Path(sys.executable)
+        windowless = exe.with_name("pythonw.exe")
+        try:
+            self._settings_proc = subprocess.Popen(
+                [str(windowless if windowless.exists() else exe), "-m", "fun_tab.settings_ui"],
+                cwd=str(Path(__file__).resolve().parent.parent),
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+        except OSError:
+            self._settings_proc = None
 
     # -- wheel -------------------------------------------------------------
 
@@ -226,7 +379,10 @@ class FunTabApp:
         def on_toggle_autostart(_icon, _item):
             autostart.toggle()
 
-        def on_open_settings(_icon, _item):
+        def on_settings(_icon, _item):
+            self.open_settings_ui()
+
+        def on_edit_file(_icon, _item):
             path = config_path()
             if not path.exists():
                 self.cfg.save(path)
@@ -242,17 +398,17 @@ class FunTabApp:
             )
 
         menu = pystray.Menu(
-            pystray.MenuItem("Fun Tab — Alt+Tab wheel", None, enabled=False),
+            pystray.MenuItem("Settings…", on_settings, default=True),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Start with Windows",
                 on_toggle_autostart,
                 checked=lambda _item: autostart.is_enabled(),
             ),
-            pystray.MenuItem("Edit settings…", on_open_settings),
+            pystray.MenuItem("Edit the settings file", on_edit_file),
             pystray.MenuItem("Reload settings", on_reload),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", on_quit),
+            pystray.MenuItem("Quit Fun Tab", on_quit),
         )
         self._tray = pystray.Icon("fun_tab", icon_img, "Fun Tab", menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
@@ -287,7 +443,11 @@ class FunTabApp:
             timeout = frame_ms if self.overlay.visible else 1000
             w.user32.MsgWaitForMultipleObjects(0, None, False, timeout, QS_ALLINPUT)
 
-            if self._reload_requested:
+            # Saving in the settings window shows up here, without the user
+            # having to know that "reload" is a thing.
+            if self._reload_requested or (
+                not self.overlay.visible and self._config_file_edited()
+            ):
                 self._reload_requested = False
                 self.reload_config()
                 frame_ms = max(2, int(1000 / max(30, self.cfg.max_fps)))
@@ -302,10 +462,19 @@ class FunTabApp:
                 w.user32.DispatchMessageW(ctypes.byref(msg))
 
             if self.overlay.visible:
-                if self.overlay.alt_released_while_open():
+                # Commit when the open hold is gone (Alt, modifiers, mouse, …).
+                # Checking Alt alone used to kill custom chords like Ctrl+Shift+U
+                # the moment they opened, because Alt was never held.
+                if (
+                    not self.overlay.sticky
+                    and time.perf_counter() - self.overlay._shown_at >= 0.25
+                    and self.hook.hold_released()
+                ):
                     self.commit()
                 else:
                     self.overlay.pump_idle()
+            else:
+                self._refresh_compat()
 
         self.hook.uninstall()
         self.tracker.uninstall()

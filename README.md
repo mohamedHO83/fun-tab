@@ -4,12 +4,16 @@ A GTA-style radial **Alt+Tab** for Windows. Hold Alt, tap Tab, flick the mouse a
 
 It replaces the Windows switcher while it runs, and it is built to be faster than the thing it replaces: a warm open paints in about **12 ms**, and transitions run at the full refresh rate of the monitor.
 
+![Fun Tab wheel](assets/fun-tab-open.png)
+
+Requires **Windows 10 or 11** and **Python 3.10+**.
+
 ```bat
 pip install -r requirements.txt
 run.bat
 ```
 
-A tray icon appears. Quit from there when you're done.
+A tray icon appears. Click it for **Settings**, or quit from there when you're done. `install_desktop_shortcut.bat` puts a shortcut on the desktop.
 
 ## Controls
 
@@ -17,13 +21,15 @@ Everything below works while Alt is held. Release Alt to switch.
 
 | Input | Action |
 |---|---|
-| **Alt+Tab** | Open the wheel with the previous window selected |
-| **Alt+Shift+Tab** | Open going backwards (least recently used first) |
-| **Ctrl+Alt+Tab** | Open in sticky mode: the wheel stays up after Alt is released |
+| **Open shortcut** | Configurable in Settings (default Alt+Tab). Supports key chords and mouse side-buttons (Mouse 4 / 5) |
+| **Alt+Tab** | Opens the wheel when that is the open shortcut |
+| **Alt+Shift+Tab** | Open going backwards (when the open shortcut is Alt+Tab) |
+| **Ctrl+Alt+Tab** | Sticky open; also the fallback while game compatibility owns Alt+Tab |
 | **Alt+`** | Open showing only the current app's windows |
 | **Flick the mouse** | Aim by direction from wherever the cursor already is - no need to drag it to the wheel first |
 | **Point at a slice** | With the cursor actually on the ring, it picks whatever it's over |
 | **Needle in the hub** | Shows the direction you're aiming, whenever the mouse has control |
+| **Ring on the desktop** | Marks the spot your aim is measured from |
 | **Tab / Shift+Tab** | Next / previous |
 | **Arrows** | Next / previous |
 | **Mouse wheel** | Next / previous |
@@ -45,7 +51,11 @@ Aiming is measured from wherever the cursor was when it last had control, not fr
 
 The pointer also only has control while it's actually moving. Anything discrete - Tab, an arrow, a digit, the scroll wheel, typing a filter - takes the wheel back and re-anchors on the cursor, so a stationary mouse can't undo your keypress and a knock of the desk can't either. Move it deliberately and it takes over again.
 
-Because the aim comes from a direction rather than a position, a **needle** in the hub shows where you're pointing. It only appears while the pointer has control, so it never disagrees with the highlight, and it sits in the gap between the hub and the icons - a full-length ray would strike through the icon of the very slice you're choosing. Repainting it writes only that band back into the layered surface, so tracking the cursor costs **1.9 ms** a frame against 0.9 ms for sitting still; re-packing the whole canvas for it would cost 7 ms.
+Because the aim comes from a direction rather than a position, two markers show you what that direction is measured from and where it currently points. Both can be turned off in Settings.
+
+A **needle** in the hub shows where you're pointing. It only appears while the pointer has control, so it never disagrees with the highlight, and it sits in the gap between the hub and the icons - a full-length ray would strike through the icon of the very slice you're choosing. Repainting it writes only that band back into the layered surface, so tracking the cursor costs **1.9 ms** a frame against 0.9 ms for sitting still; re-packing the whole canvas for it would cost 7 ms.
+
+A small **ring** sits on the desktop at the pivot - where the cursor was when the wheel opened. It greys out rather than disappearing when a keypress takes control, because a marker that vanished every time you pressed Tab would answer "where is my aim measured from" only when you weren't asking. It lives in its own tiny layered window under the wheel, so moving it costs nothing and it can never cover a slice.
 
 ## What makes it fast
 
@@ -77,7 +87,17 @@ Take the absolute values with a pinch of salt - this laptop's clocks swing by 2-
 
 ## Settings
 
-Settings live in `%APPDATA%\fun-tab\config.json`, written with defaults on first run. Edit it from the tray menu, then **Reload settings** - no restart. Unknown keys are ignored and out-of-range values are clamped, so a bad edit can't stop it from starting.
+Click the tray icon for a settings window. Everything in it is in plain language, and the panel on the right is **a preview of your own desktop** - the real screenshot, the real window list, put through the same blur the switcher uses - so you can drag the blur slider and watch what it does rather than guess. Save applies it: the running switcher notices the file changed and reloads on its own, no restart and no **Reload settings**.
+
+![Settings window](assets/settings-window.png)
+
+The screenshot above is a demo scene (fake wallpaper, fake apps), not anyone's real desktop.
+
+It hashes the file rather than watching its timestamp, because Windows only moves file times on about a 16ms tick and two quick saves of a same-sized file can share one.
+
+### The file
+
+Everything still lives in `%APPDATA%\fun-tab\config.json`, written with defaults on first run, and hand-edits apply the same way the window's do. The window shows the settings worth changing; the table below is the full set. Unknown keys are ignored and out-of-range values are clamped, so a bad edit can't stop it from starting.
 
 | Key | Default | Notes |
 |---|---|---|
@@ -98,6 +118,8 @@ Settings live in `%APPDATA%\fun-tab\config.json`, written with defaults on first
 | `prefetch_previews` | `true` | Capture the other windows in the background too |
 | `capture_minimized` | `true` | Restore minimised windows off-screen to preview them |
 | `thumb_ttl` | `4.0` | Seconds before a captured preview is refreshed |
+| `aim_needle` | `true` | The needle in the hub showing which way you're aiming |
+| `aim_origin` | `true` | The ring marking the spot your aim is measured from |
 | `show_counter`, `show_subtitle`, `show_hints` | `true` | Hub text: `n/N`, app name, key hints |
 | `mru_order` | `true` | Most-recently-used ordering |
 | `search_enabled`, `digit_jump`, `close_key_enabled` | `true` | Turn off the typing, number and close bindings |
@@ -105,27 +127,38 @@ Settings live in `%APPDATA%\fun-tab\config.json`, written with defaults on first
 | `minimized_last` | `false` | Push minimised windows to the end of the wheel |
 | `exclude_exes` | `[]` | e.g. `["teams.exe"]` - never show these |
 | `exclude_titles` | `[]` | Substring match on window titles |
+| `open_hotkey` | `"alt+tab"` | Open chord: `alt+tab`, `ctrl+alt+tab`, `mouse4`, `ctrl+mouse5`, … |
+| `open_sticky` | `false` | Keep the wheel open after releasing the open shortcut |
+| `pause_in_games` | `true` | Uninstall input hooks while a game is in front (strongest anti-cheat option short of quitting) |
+| `game_compat` | `"auto"` | `auto` steps aside when a game is in front, `always` always leaves plain Alt+Tab alone, `off` takes Alt+Tab when that is the open shortcut |
+| `game_exes` | `[]` | Extra executable names auto-mode treats as games |
 | `colors` | `{}` | Override any palette key, e.g. `{"accent": "#ff8800", "text": "#ffffff"}` |
 
 ## Tray menu
 
+- **Settings…** - the settings window, with the live preview
 - **Start with Windows** - adds a `pythonw` launcher to the per-user Run key
-- **Edit settings** - opens `config.json`
-- **Reload settings** - applies it without restarting
-- **Quit**
+- **Edit the settings file** - opens `config.json` for the keys the window doesn't show
+- **Reload settings** - forces a reload; saving already does this on its own
+- **Quit Fun Tab**
 
 ## Development
 
 ```bat
-python -m pytest            # 228 tests, no display needed
+python -m pytest            # tests, no display needed
 python bench.py             # render timings, cold and warm
 python smoke.py             # creates real layered windows and times a live open
 python backdrop_probe.py    # screenshots the backdrop and checks it isn't a flat tint
 python live_check.py        # installs the real hook, sends a real Alt+Tab, screenshots it
-python -m fun_tab.preview --demo --light   # writes preview_wheel.png
+python settings_check.py    # edits and saves in the real settings window, checks it applies
+python -m fun_tab.settings_ui              # the settings window on its own
+python -m fun_tab.settings_ui --demo --screenshot=assets/settings-window.png
+python -m fun_tab.preview --scene --out=assets/fun-tab-open.png
 ```
 
-`preview.py` renders the wheel and preview card to a PNG without installing the keyboard hook, which is the quickest way to iterate on the look.
+`preview.py` renders the wheel and preview card to a PNG without installing the keyboard hook, which is the quickest way to iterate on the look. Its `ScenePreview` is what the settings window shows, and it shares the backdrop treatment with the overlay (`treat_plate`) so the two can't drift apart.
+
+Local probe shots (`live_open.png`, `probe_blur.png`, and the rest) stay gitignored on purpose: they are captures of the machine that ran the check, not something to publish.
 
 ## Notes and caveats
 
@@ -133,4 +166,8 @@ python -m fun_tab.preview --demo --light   # writes preview_wheel.png
 - Capture is unavailable on some remote sessions; those fall back to a plain translucent veil.
 - Works with borderless and windowed games. Exclusive fullscreen can block any overlay.
 - Only one instance runs at a time.
-- **Anti-cheat:** Fun Tab installs a global keyboard hook (`WH_KEYBOARD_LL`) and a topmost overlay. It is not a cheat and never reads another process's memory, but hooks and overlays alone can trip heuristics. Quit it from the tray before launching anything protected by Easy Anti-Cheat, BattlEye, Vanguard or FACEIT.
+- **Anti-cheat:** Fun Tab installs a global keyboard hook (`WH_KEYBOARD_LL`), a mouse hook for side-buttons, and a topmost overlay. It is not a cheat and never reads another process's memory, but hooks and overlays alone can trip heuristics. **Pause Fun Tab completely while a game is in front** (on by default) uninstalls those hooks for as long as a game is focused — that is the strongest option short of quitting from the tray before launch. Game compatibility mode separately leaves native Alt+Tab alone when a game is in front.
+
+## License
+
+[MIT](LICENSE)
