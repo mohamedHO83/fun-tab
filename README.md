@@ -13,7 +13,7 @@ pip install -r requirements.txt
 run.bat
 ```
 
-A tray icon appears. Click it for **Settings**, or quit from there when you're done. `install_desktop_shortcut.bat` puts a shortcut on the desktop.
+A tray icon appears (look behind the **^** arrow on the taskbar if Windows hid it). Click it for **Settings**, or quit from there when you're done. Running Fun Tab again also asks whether to quit, which is the way out if the icon is missing. `install_desktop_shortcut.bat` puts a shortcut on the desktop.
 
 ## Controls
 
@@ -136,11 +136,15 @@ Everything still lives in `%APPDATA%\fun-tab\config.json`, written with defaults
 
 ## Tray menu
 
-- **Settings…** - the settings window, with the live preview
+Windows 11 often hides a new icon behind the **^** arrow next to the clock. Fun Tab asks Windows to pin it, and shows a balloon the first time it starts.
+
+- **Settings…** - the settings window, with the live preview (also a left click)
 - **Start with Windows** - adds a `pythonw` launcher to the per-user Run key
 - **Edit the settings file** - opens `config.json` for the keys the window doesn't show
 - **Reload settings** - forces a reload; saving already does this on its own
 - **Quit Fun Tab**
+
+If the icon is missing, run Fun Tab again and choose **Yes** when it asks to quit.
 
 ## Development
 

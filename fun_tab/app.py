@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
-import os
 import sys
 import threading
 import time
 
-from . import autostart, hook as hook_actions
+from . import hook as hook_actions
 from . import win32_types as w
 from .config import Config, config_path
 from .hook import AltTabHook
@@ -359,77 +358,17 @@ class FunTabApp:
     # -- tray --------------------------------------------------------------
 
     def _start_tray(self) -> None:
-        try:
-            import pystray
-            from PIL import Image, ImageDraw
-        except ImportError:
-            return
+        from .tray import TrayIcon
 
-        icon_img = self._load_app_icon()
-        if icon_img is None:
-            icon_img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(icon_img)
-            draw.ellipse((4, 4, 60, 60), outline=(120, 180, 255, 255), width=5)
-            draw.ellipse((23, 23, 41, 41), fill=(120, 180, 255, 235))
-
-        def on_quit(icon, _item):
-            icon.stop()
-            self.shutdown()
-
-        def on_toggle_autostart(_icon, _item):
-            autostart.toggle()
-
-        def on_settings(_icon, _item):
-            self.open_settings_ui()
-
-        def on_edit_file(_icon, _item):
-            path = config_path()
-            if not path.exists():
-                self.cfg.save(path)
-            try:
-                os.startfile(str(path))  # noqa: S606 - user-initiated
-            except OSError:
-                pass
-
-        def on_reload(_icon, _item):
-            self._reload_requested = True
-            w.user32.PostThreadMessageW(
-                int(w.kernel32.GetCurrentThreadId()), w.WM_NULL, 0, 0
+        tray = TrayIcon(self)
+        if not tray.install():
+            tray.uninstall()
+            w.message_box(
+                "Fun Tab is running, but the tray icon could not be shown.\n\n"
+                "Run Fun Tab again if you want to quit it."
             )
-
-        menu = pystray.Menu(
-            pystray.MenuItem("Settings…", on_settings, default=True),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                "Start with Windows",
-                on_toggle_autostart,
-                checked=lambda _item: autostart.is_enabled(),
-            ),
-            pystray.MenuItem("Edit the settings file", on_edit_file),
-            pystray.MenuItem("Reload settings", on_reload),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit Fun Tab", on_quit),
-        )
-        self._tray = pystray.Icon("fun_tab", icon_img, "Fun Tab", menu)
-        threading.Thread(target=self._tray.run, daemon=True).start()
-
-    @staticmethod
-    def _load_app_icon():
-        from pathlib import Path
-
-        from PIL import Image
-
-        root = Path(__file__).resolve().parent.parent
-        for name in ("fun-tab-tray.png", "fun-tab-logo.png", "fun-tab.ico"):
-            path = root / "assets" / name
-            if path.exists():
-                try:
-                    return Image.open(path).convert("RGBA").resize(
-                        (64, 64), Image.Resampling.LANCZOS
-                    )
-                except Exception:
-                    continue
-        return None
+            return
+        self._tray = tray
 
     # -- message loop ------------------------------------------------------
 
@@ -475,13 +414,15 @@ class FunTabApp:
                     self.overlay.pump_idle()
             else:
                 self._refresh_compat()
+                if self._tray is not None:
+                    self._tray.try_promote()
 
         self.hook.uninstall()
         self.tracker.uninstall()
         self.overlay.destroy()
         if self._tray is not None:
             try:
-                self._tray.stop()
+                self._tray.uninstall()
             except Exception:
                 pass
 
@@ -492,8 +433,9 @@ def main() -> int:
 
     mutex = w.kernel32.CreateMutexW(None, False, "Local\\FunTabAltTabMutex")
     if w.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        print("Fun Tab is already running (see the tray icon).", file=sys.stderr)
-        return 1
+        from .tray import offer_to_quit_running
+
+        return offer_to_quit_running()
 
     app = FunTabApp()
     try:

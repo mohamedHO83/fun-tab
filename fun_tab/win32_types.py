@@ -807,3 +807,107 @@ def accent_rgb() -> tuple[int, int, int] | None:
         return None
     value = int(color.value)
     return ((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF)
+
+
+# ---------------------------------------------------------------------------
+# Tray icon (Shell_NotifyIcon) and a MessageBox when pythonw has no console.
+# ---------------------------------------------------------------------------
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", ctypes.c_wchar * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", ctypes.c_wchar * 256),
+        ("uVersion", wintypes.UINT),
+        ("szInfoTitle", ctypes.c_wchar * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+        ("guidItem", GUID),
+        ("hBalloonIcon", wintypes.HICON),
+    ]
+
+
+NIM_ADD = 0
+NIM_MODIFY = 1
+NIM_DELETE = 2
+NIF_MESSAGE = 0x00000001
+NIF_ICON = 0x00000002
+NIF_TIP = 0x00000004
+NIF_INFO = 0x00000010
+NIF_GUID = 0x00000020
+NIF_SHOWTIP = 0x00000080
+NIIF_INFO = 0x00000001
+NIIF_NOSOUND = 0x00000010
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x00000010
+LR_DEFAULTSIZE = 0x00000040
+IDI_APPLICATION = 32512
+WM_APP = 0x8000
+MF_STRING = 0x00000000
+MF_SEPARATOR = 0x00000800
+MF_CHECKED = 0x00000008
+MF_UNCHECKED = 0x00000000
+TPM_RIGHTBUTTON = 0x0002
+TPM_RETURNCMD = 0x0100
+MB_OK = 0x00000000
+MB_YESNO = 0x00000004
+MB_ICONINFORMATION = 0x00000040
+MB_ICONQUESTION = 0x00000020
+MB_SETFOREGROUND = 0x00010000
+MB_TOPMOST = 0x00040000
+IDYES = 6
+
+shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+user32.LoadImageW.argtypes = [
+    wintypes.HINSTANCE,
+    wintypes.LPCWSTR,
+    wintypes.UINT,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.UINT,
+]
+user32.LoadImageW.restype = wintypes.HANDLE
+user32.LoadIconW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+user32.LoadIconW.restype = wintypes.HICON
+user32.DestroyIcon.argtypes = [wintypes.HICON]
+user32.DestroyIcon.restype = wintypes.BOOL
+user32.CreatePopupMenu.restype = wintypes.HMENU
+user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+user32.AppendMenuW.restype = wintypes.BOOL
+user32.TrackPopupMenu.argtypes = [
+    wintypes.HMENU,
+    wintypes.UINT,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.HWND,
+    ctypes.c_void_p,
+]
+user32.TrackPopupMenu.restype = wintypes.BOOL
+user32.DestroyMenu.argtypes = [wintypes.HMENU]
+user32.DestroyMenu.restype = wintypes.BOOL
+user32.SetMenuDefaultItem.argtypes = [wintypes.HMENU, wintypes.UINT, wintypes.UINT]
+user32.SetMenuDefaultItem.restype = wintypes.BOOL
+user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+user32.MessageBoxW.restype = ctypes.c_int
+user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wintypes.UINT
+
+
+def message_box(text: str, title: str = "Fun Tab", flags: int = MB_OK | MB_ICONINFORMATION) -> int:
+    return int(user32.MessageBoxW(None, text, title, flags | MB_SETFOREGROUND | MB_TOPMOST))
