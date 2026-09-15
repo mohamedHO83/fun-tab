@@ -129,6 +129,20 @@ def test_a_config_from_before_the_aiming_options_keeps_them_on(tmp_path):
     assert cfg.aim_origin is True
 
 
+def test_group_by_app_is_on_by_default():
+    assert Config().group_by_app is True
+
+
+def test_exe_lists_are_normalised_on_clamp():
+    cfg = Config(
+        exclude_exes=["Chrome", r"C:\Apps\Slack.EXE", "chrome.exe", ""],
+        pinned_exes=["Spotify", "chrome"],
+    )
+    cfg.clamp()
+    assert cfg.exclude_exes == ["chrome.exe", "slack.exe"]
+    assert cfg.pinned_exes == ["spotify.exe"], "a hidden app cannot also be pinned"
+
+
 # -- colour helpers ---------------------------------------------------------
 
 

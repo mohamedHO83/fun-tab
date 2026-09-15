@@ -16,7 +16,9 @@ On a machine that has Python 3.10+:
 build.bat
 ```
 
-That writes `dist\FunTab.zip`. They unzip it and double-click **FunTab.exe**. Keep the `_internal` folder next to the exe — it is not optional. The first start can trip SmartScreen because the exe is unsigned; *More info* → *Run anyway*.
+That writes `dist\FunTab.zip`, and `dist\FunTabSetup.exe` if [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed. They can run the setup (Start Menu + optional desktop shortcut, no `_internal` folder to keep) or unzip the zip and double-click **FunTab.exe**. Keep `_internal` next to the exe if you use the zip — it is not optional. The first start can trip SmartScreen because the exe is unsigned; *More info* → *Run anyway*.
+
+A tagged GitHub release (`v0.3.0` and so on) builds both files automatically.
 
 A tray icon appears (look behind the **^** arrow on the taskbar if Windows hid it). Click it for **Settings**, or quit from there when you're done. Running Fun Tab again also asks whether to quit, which is the way out if the icon is missing. `install_desktop_shortcut.bat` puts a shortcut on the desktop (the packed exe if you have built it, otherwise the source launcher).
 
@@ -51,13 +53,16 @@ Everything below works while Alt is held. Release Alt to switch.
 | **Type any letters** | Filter the wheel by window title, app name or executable |
 | **Backspace** | Edit the filter |
 | **Home / End** | First / last window |
-| **`** | Cycle between windows of the selected app |
+| **`** | Cycle between windows of the selected app (also expands a grouped slice) |
 | **Enter**, **Space**, **left click** | Switch to the selection (a click anywhere counts) |
+| **Right click a slice** | Hide this app, pin, close, or minimise |
 | **Delete**, **Ctrl+W**, **Ctrl+Q** | Close the selected window, keep the wheel open |
 | **Ctrl+M** | Minimise the selected window |
+| **Ctrl+H** | Hide this app from the wheel (saved in Settings) |
+| **Ctrl+P** | Pin / unpin this app near the front of the wheel |
 | **Esc** | Clear the filter, or cancel if there is no filter |
 
-Windows are ordered most-recently-used first, so Alt+Tab always lands on the app you came from and Alt+Tab+Tab lands on the one before it.
+Windows are ordered most-recently-used first, so Alt+Tab always lands on the app you came from and Alt+Tab+Tab lands on the one before it. With **one slice per application** (on by default) that second step is the previous *app*, not another window of the same one. Press `` ` `` to rotate through that app's windows; typing a filter expands matches so you can pick a specific title.
 
 ### Mouse and keyboard don't fight
 
@@ -138,11 +143,13 @@ Everything still lives in `%APPDATA%\fun-tab\config.json`, written with defaults
 | `title_privacy` | `"full"` | `full` shows window titles; `app` shows application names only |
 | `privacy_mode` | `false` | Forces the privacy preset (no previews/prefetch/minimised capture/close keys; app labels) |
 | `mru_order` | `true` | Most-recently-used ordering |
+| `group_by_app` | `true` | One slice per application; `` ` `` cycles that app's windows |
 | `search_enabled`, `digit_jump`, `close_key_enabled` | `true` | Turn off the typing, number and close bindings |
 | `close_confirm` | `true` | Ask before the first Delete/Ctrl+W close each session |
 | `wrap_navigation` | `true` | Cycling past the end wraps around |
 | `minimized_last` | `false` | Push minimised windows to the end of the wheel |
-| `exclude_exes` | `[]` | e.g. `["teams.exe"]` - never show these (password managers are always excluded) |
+| `exclude_exes` | `[]` | e.g. `["teams.exe"]` - never show these (password managers are always excluded). Also edited as **Hidden apps** in Settings. |
+| `pinned_exes` | `[]` | e.g. `["spotify.exe"]` - keep these just after the current app |
 | `exclude_titles` | `[]` | Substring match on window titles |
 | `open_hotkey` | `"alt+tab"` | Open chord: `alt+tab`, `ctrl+alt+tab`, `mouse4`, `ctrl+mouse5`, … |
 | `open_sticky` | `false` | Keep the wheel open after releasing the open shortcut |
@@ -158,8 +165,10 @@ Windows 11 often hides a new icon behind the **^** arrow next to the clock. Fun 
 
 - **Settings…** - the settings window, with the live preview (also a left click)
 - **Start with Windows** - adds Fun Tab to the per-user Run key (`FunTab.exe` from a packed build, or a `pythonw` shim from source)
+- **Pause Fun Tab** - uninstalls the keyboard and mouse hooks until you resume; the tray icon stays, labelled *paused*
 - **Edit the settings file** - opens `config.json` for the keys the window doesn't show
 - **Reload settings** - forces a reload; saving already does this on its own
+- **About Fun Tab** - version number
 - **Quit Fun Tab**
 
 If the icon is missing, run Fun Tab again and choose **Yes** when it asks to quit.
@@ -167,7 +176,7 @@ If the icon is missing, run Fun Tab again and choose **Yes** when it asks to qui
 ## Development
 
 ```bat
-build.bat                   # dist\FunTab\FunTab.exe and dist\FunTab.zip
+build.bat                   # dist\FunTab\FunTab.exe, dist\FunTab.zip, and FunTabSetup.exe if Inno Setup is installed
 python -m pytest            # tests, no display needed
 python bench.py             # render timings, cold and warm
 python smoke.py             # creates real layered windows and times a live open

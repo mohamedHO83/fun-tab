@@ -154,6 +154,13 @@ SETTINGS: tuple[Setting, ...] = (
     ),
     Setting("autostart", "Start Fun Tab when Windows starts", "check", "Windows"),
     Setting("mru_order", "List the most recently used window first", "check", "Windows"),
+    Setting(
+        "group_by_app",
+        "One slice per application",
+        "check",
+        "Windows",
+        hint="Many windows of the same app become one slice. Press ` to cycle them.",
+    ),
     Setting("minimized_last", "Push minimised windows to the end", "check", "Windows"),
     Setting(
         "close_key_enabled", "Let Delete and Ctrl+W close a window", "check", "Windows"
@@ -242,6 +249,8 @@ def config_with(base: Config, values: dict[str, Any]) -> Config:
                 value = float(value)
             elif isinstance(current, str):
                 value = str(value)
+            elif isinstance(current, list):
+                value = [str(item) for item in value]
         except (TypeError, ValueError):
             continue
         setattr(cfg, key, value)
@@ -322,6 +331,9 @@ class SettingsWindow:
         self._image_ref = None
         self._snapping = False
         self._hotkey_buttons: dict = {}
+        self._exclude_exes = list(cfg.exclude_exes)
+        self._pinned_exes = list(cfg.pinned_exes)
+        self._listboxes: dict = {}
 
         self.root = tk.Tk()
         self.root.title(WINDOW_TITLE)
@@ -406,6 +418,22 @@ class SettingsWindow:
             if setting.group != group:
                 continue
             row = self._build_control(frame, setting, row)
+        if group == "Windows":
+            row = self._build_exe_list(
+                frame,
+                row,
+                attr="_pinned_exes",
+                title="Pinned apps",
+                hint="These stay near the front of the wheel, just after the app you came from.",
+            )
+        if group == "Privacy":
+            row = self._build_exe_list(
+                frame,
+                row,
+                attr="_exclude_exes",
+                title="Hidden apps",
+                hint="These never appear on the wheel. Password managers are always hidden.",
+            )
         return frame
 
     def _build_control(self, frame, setting: Setting, row: int) -> int:
@@ -498,6 +526,65 @@ class SettingsWindow:
             )
         return row + 1
 
+    def _build_exe_list(self, frame, row: int, *, attr: str, title: str, hint: str) -> int:
+        ttk = self.ttk
+        ttk.Label(frame, text=title).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(self.px(8), self.px(2))
+        )
+        row += 1
+        box = self.tk.Listbox(frame, height=5, exportselection=False)
+        box.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=self.px(2))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=2, sticky="n", padx=(self.px(6), 0))
+        ttk.Button(
+            buttons, text="Add…", command=lambda a=attr: self._add_exe(a)
+        ).grid(row=0, column=0, sticky="ew", pady=(0, self.px(4)))
+        ttk.Button(
+            buttons, text="Remove", command=lambda a=attr: self._remove_exe(a)
+        ).grid(row=1, column=0, sticky="ew")
+        self._listboxes[attr] = box
+        self._fill_exe_list(attr)
+        row += 1
+        ttk.Label(frame, text=hint, foreground="#666666").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(0, self.px(4))
+        )
+        return row + 1
+
+    def _exe_names(self, attr: str) -> list[str]:
+        return list(getattr(self, attr))
+
+    def _fill_exe_list(self, attr: str) -> None:
+        box = self._listboxes.get(attr)
+        if box is None:
+            return
+        box.delete(0, "end")
+        for name in self._exe_names(attr):
+            box.insert("end", name)
+
+    def _add_exe(self, attr: str) -> None:
+        from .config import _normalize_exe_names
+
+        picked = _pick_exe(self.root, self.ui)
+        if not picked:
+            return
+        names = _normalize_exe_names(self._exe_names(attr) + [picked])
+        setattr(self, attr, names)
+        self._fill_exe_list(attr)
+        self.on_change()
+
+    def _remove_exe(self, attr: str) -> None:
+        box = self._listboxes.get(attr)
+        if box is None:
+            return
+        selection = list(box.curselection())
+        if not selection:
+            return
+        names = self._exe_names(attr)
+        drop = {names[i] for i in selection if 0 <= i < len(names)}
+        setattr(self, attr, [name for name in names if name not in drop])
+        self._fill_exe_list(attr)
+        self.on_change()
+
     # -- values ------------------------------------------------------------
 
     def _load(self, cfg: Config) -> None:
@@ -517,6 +604,10 @@ class SettingsWindow:
                 )
             if setting.kind == "hotkey":
                 self._refresh_hotkey_button(setting.key)
+        self._exclude_exes = list(cfg.exclude_exes)
+        self._pinned_exes = list(cfg.pinned_exes)
+        for attr in ("_exclude_exes", "_pinned_exes"):
+            self._fill_exe_list(attr)
         self._refresh_swatch()
 
     def _refresh_hotkey_button(self, key: str) -> None:
@@ -536,7 +627,11 @@ class SettingsWindow:
             values[setting.key] = (
                 _value_for(setting, var.get()) if setting.kind == "choice" else var.get()
             )
-        return config_with(self.cfg, values)
+        cfg = config_with(self.cfg, values)
+        cfg.exclude_exes = list(self._exclude_exes)
+        cfg.pinned_exes = list(self._pinned_exes)
+        cfg.clamp()
+        return cfg
 
     def _refresh_swatch(self) -> None:
         value = str(self.vars["accent"].get())
@@ -753,6 +848,81 @@ def _capture_hotkey(timeout_s: float = 6.0):
             w.user32.UnhookWindowsHookEx(kb_hook)
 
     return result[0] if result else None
+
+
+def _pick_exe(parent, ui: float = 1.0) -> str:
+    """Ask for an executable, offering the apps that are open right now."""
+    from tkinter import simpledialog
+
+    from .config import _normalize_exe_names
+    from .windows_enum import enumerate_windows
+
+    choices: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        for app in enumerate_windows():
+            name = app.exe_name.lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            label = app.app_name or name
+            choices.append((name, f"{label}  ({name})"))
+    except Exception:
+        choices = []
+    choices.sort(key=lambda item: item[1].lower())
+
+    if choices:
+        import tkinter as tk
+        from tkinter import ttk
+
+        result: list[str] = []
+        dialog = tk.Toplevel(parent)
+        dialog.title("Hide or pin an app")
+        dialog.transient(parent)
+        dialog.resizable(False, False)
+        pad = max(1, int(round(10 * ui)))
+        ttk.Label(dialog, text="Open apps on this PC, or type an executable name.").pack(
+            anchor="w", padx=pad, pady=(pad, 4)
+        )
+        box = tk.Listbox(dialog, height=min(12, max(4, len(choices))), width=48)
+        box.pack(fill="both", expand=True, padx=pad)
+        for _name, label in choices:
+            box.insert("end", label)
+        typed = ttk.Entry(dialog, width=40)
+        typed.pack(fill="x", padx=pad, pady=pad)
+        typed.focus_set()
+
+        def accept(_event=None):
+            selection = box.curselection()
+            if selection:
+                result.append(choices[int(selection[0])][0])
+            else:
+                names = _normalize_exe_names([typed.get()])
+                if names:
+                    result.append(names[0])
+            dialog.destroy()
+
+        def cancel():
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=pad, pady=(0, pad))
+        ttk.Button(buttons, text="OK", command=accept).pack(side="right")
+        ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right", padx=(0, pad))
+        box.bind("<Double-Button-1>", accept)
+        dialog.bind("<Return>", accept)
+        dialog.bind("<Escape>", lambda _e: cancel())
+        dialog.grab_set()
+        parent.wait_window(dialog)
+        return result[0] if result else ""
+
+    entered = simpledialog.askstring(
+        "Executable",
+        "Executable name (for example chrome.exe):",
+        parent=parent,
+    )
+    names = _normalize_exe_names([entered or ""])
+    return names[0] if names else ""
 
 
 def _label_for(setting: Setting, value: Any) -> str:

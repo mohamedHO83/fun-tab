@@ -126,6 +126,12 @@ def test_the_backdrop_controls_are_offered():
     assert {"backdrop", "dim_blur", "dim_veil"} <= keys
 
 
+def test_group_by_app_is_offered_on_the_windows_tab():
+    setting = {s.key: s for s in SETTINGS}["group_by_app"]
+    assert setting.kind == "check"
+    assert setting.group == "Windows"
+
+
 @pytest.mark.parametrize(
     "percent_of, value, expected",
     [(1.0, 1.0, "100%"), (1.0, 0.5, "50%"), (200.0, 40, "20%"), (None, 1.5, "1.5")],

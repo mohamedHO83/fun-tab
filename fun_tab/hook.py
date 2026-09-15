@@ -23,6 +23,8 @@ COMMIT = "commit"
 CANCEL = "cancel"
 CLOSE = "close"
 MINIMIZE = "minimize"
+HIDE = "hide"
+PIN = "pin"
 TYPE = "type"
 BACKSPACE = "backspace"
 CLEAR = "clear"
@@ -469,6 +471,13 @@ class AltTabHook:
             if self._ctrl_held() and vk == 0x4D:  # Ctrl+M
                 self._emit(MINIMIZE)
                 return True
+
+        if self._ctrl_held() and vk == 0x48:  # Ctrl+H
+            self._emit(HIDE)
+            return True
+        if self._ctrl_held() and vk == 0x50:  # Ctrl+P
+            self._emit(PIN)
+            return True
 
         digit = _digit_for(vk)
         if digit is not None and self.digit_jump and not typing:

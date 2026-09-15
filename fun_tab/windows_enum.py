@@ -6,7 +6,7 @@ import ctypes
 import os
 import threading
 from ctypes import wintypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable, Optional
 
 import numpy as np
@@ -47,6 +47,9 @@ class AppWindow:
     app_name: str = ""
     minimized: bool = False
     maximized: bool = False
+    # When the wheel is grouped, the face window carries how many peers it stands for.
+    group_count: int = 1
+    peer_hwnds: tuple[int, ...] = ()
 
     @property
     def exe_name(self) -> str:
@@ -494,6 +497,71 @@ def order_windows(
     if minimized_last:
         ordered.sort(key=lambda a: a.minimized)  # stable: keeps the order above
     return ordered
+
+
+def group_key(app: AppWindow) -> str:
+    """Identity used to collapse windows of the same application."""
+    if app.exe_path:
+        return os.path.normcase(app.exe_path)
+    return f"class:{app.class_name}"
+
+
+def pin_windows(
+    apps: list[AppWindow], pinned_exes: Iterable[str] = ()
+) -> list[AppWindow]:
+    """Keep the current (first) window, then pinned apps, then the rest."""
+    if not apps:
+        return []
+    rank = {name.lower(): index for index, name in enumerate(pinned_exes) if name}
+    if not rank:
+        return list(apps)
+    first, rest = apps[0], list(apps[1:])
+    pinned = [app for app in rest if app.exe_name.lower() in rank]
+    unpinned = [app for app in rest if app.exe_name.lower() not in rank]
+    pinned.sort(key=lambda app: rank[app.exe_name.lower()])
+    return [first, *pinned, *unpinned]
+
+
+def group_windows(
+    apps: list[AppWindow], pinned_exes: Iterable[str] = ()
+) -> list[AppWindow]:
+    """One face window per application, in the incoming order of first seen.
+
+    The face is the most-recent window of that app (first in ``apps`` for that
+    key). `` ` `` later rotates which window is the face.
+    """
+    buckets: dict[str, list[AppWindow]] = {}
+    order: list[str] = []
+    for app in apps:
+        key = group_key(app)
+        if key not in buckets:
+            order.append(key)
+            buckets[key] = []
+        buckets[key].append(app)
+
+    faces: list[AppWindow] = []
+    for key in order:
+        peers = buckets[key]
+        face = peers[0]
+        hwnds = tuple(peer.hwnd for peer in peers)
+        faces.append(replace(face, group_count=len(peers), peer_hwnds=hwnds))
+    return pin_windows(faces, pinned_exes)
+
+
+def present_windows(
+    apps: list[AppWindow],
+    *,
+    group_by_app: bool = False,
+    pinned_exes: Iterable[str] = (),
+    expand_app: bool = False,
+) -> list[AppWindow]:
+    """What the wheel should show: grouped, pinned, or every window."""
+    items = list(apps)
+    if expand_app:
+        return items
+    if group_by_app:
+        return group_windows(items, pinned_exes=pinned_exes)
+    return pin_windows(items, pinned_exes)
 
 
 # ---------------------------------------------------------------------------

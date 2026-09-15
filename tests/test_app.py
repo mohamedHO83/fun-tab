@@ -261,3 +261,88 @@ def test_ensure_consent_cancel_aborts(tmp_path, monkeypatch):
         lambda text, title="Fun Tab", flags=0: w.IDCANCEL,
     )
     assert _ensure_consent() is False
+
+
+def test_hide_selected_app_writes_exclude_exes():
+    from fun_tab.windows_enum import AppWindow
+
+    app = FunTabApp()
+    app.cfg = Config()
+    app.overlay.cfg = app.cfg
+    target = AppWindow(
+        hwnd=9,
+        title="Inbox",
+        class_name="Chrome_WidgetWin_1",
+        pid=1,
+        exe_path=r"C:\Program Files\Google\Chrome\chrome.exe",
+        app_name="Google Chrome",
+    )
+    app.overlay._visible = True
+    app.overlay._apps = [target]
+    app.overlay._all_apps = [target]
+    app.overlay._selected = 0
+    saved = []
+    app.cfg.save = lambda path=None: saved.append(list(app.cfg.exclude_exes)) or True  # type: ignore
+    cancelled = []
+    app.overlay.set_callbacks(on_commit=lambda: None, on_cancel=lambda: cancelled.append(True))
+
+    app._hide_selected_app()
+    assert "chrome.exe" in app.cfg.exclude_exes
+    assert saved
+    assert cancelled == [True], "hiding the only app should close the wheel"
+
+
+def test_pin_selected_app_round_trips():
+    from fun_tab.windows_enum import AppWindow
+
+    app = FunTabApp()
+    app.cfg = Config()
+    app.overlay.cfg = app.cfg
+    target = AppWindow(
+        hwnd=3,
+        title="Slack",
+        class_name="Slack",
+        pid=1,
+        exe_path=r"C:\Slack\slack.exe",
+        app_name="Slack",
+    )
+    extra = AppWindow(
+        hwnd=4,
+        title="Notes",
+        class_name="Notepad",
+        pid=2,
+        exe_path=r"C:\Windows\notepad.exe",
+        app_name="Notepad",
+    )
+    app.overlay._all_apps = [extra, target]
+    app.overlay._apps = [extra, target]
+    app.overlay._selected = 1
+    app.cfg.save = lambda path=None: True  # type: ignore
+
+    app._toggle_pin_selected()
+    assert app.cfg.pinned_exes == ["slack.exe"]
+    app._toggle_pin_selected()
+    assert app.cfg.pinned_exes == []
+
+
+def test_manual_pause_keeps_hooks_uninstalled(monkeypatch):
+    app = FunTabApp()
+    app.cfg = Config(pause_in_games=False, game_compat="off")
+    app.hook.install = lambda: setattr(app.hook, "_kb_hook", 1)  # type: ignore
+    app.hook.uninstall = lambda: setattr(app.hook, "_kb_hook", None)  # type: ignore
+    app.hook._kb_hook = 1
+    monkeypatch.setattr("fun_tab.game_detect.foreground_is_task_switcher", lambda: False)
+    monkeypatch.setattr(
+        "fun_tab.game_detect.foreground_looks_like_a_game", lambda _extra=(): False
+    )
+
+    app.set_paused(True)
+    assert app._paused_manually is True
+    assert app.hook.installed is False
+
+    app._refresh_compat()
+    assert app.hook.installed is False, "a tray pause must outlast the game-detect poll"
+
+    app.set_paused(False)
+    assert app._paused_manually is False
+    assert app.hook.installed is True

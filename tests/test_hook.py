@@ -414,6 +414,20 @@ def test_ctrl_m_minimizes():
     assert kb.kinds() == [hook_mod.MINIMIZE]
 
 
+def test_ctrl_h_hides_the_selected_app():
+    kb = Keyboard(opened=True)
+    kb.ctrl = True
+    kb.press(0x48)
+    assert kb.kinds() == [hook_mod.HIDE]
+
+
+def test_ctrl_p_pins_the_selected_app():
+    kb = Keyboard(opened=True)
+    kb.ctrl = True
+    kb.press(0x50)
+    assert kb.kinds() == [hook_mod.PIN]
+
+
 def test_close_keys_can_be_disabled():
     kb = Keyboard(opened=True)
     kb.hook.close_key_enabled = False

@@ -21,6 +21,7 @@ from .windows_enum import (
     enumerate_windows,
     foreground_hwnd,
     minimize_window,
+    present_windows,
 )
 
 
@@ -68,12 +69,16 @@ class FunTabApp:
         self._resume_hooks_at = 0.0
         # After the user confirms one close this session, skip further prompts.
         self._close_confirmed_session = False
+        self._paused_manually = False
+        self._menu_open = False
 
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
         self.overlay.create()
-        self.overlay.set_callbacks(on_commit=self.commit, on_cancel=self.cancel)
+        self.overlay.set_callbacks(
+            on_commit=self.commit, on_cancel=self.cancel, on_context=self._slice_menu
+        )
 
         self.tracker.install()
 
@@ -158,6 +163,12 @@ class FunTabApp:
 
         self.hook.compat_active = active
         self.overlay.compat_active = active
+
+        if self._paused_manually:
+            if self.hook.installed:
+                self.cancel()
+                self.hook.uninstall()
+            return
 
         want_pause = bool(self.cfg.pause_in_games) and not self.overlay.visible
         if want_pause and (in_game or transitional):
@@ -257,14 +268,22 @@ class FunTabApp:
             )
             if same_app and apps:
                 apps = self._same_app_peers(apps)
-            if not apps:
+            shown = present_windows(
+                apps,
+                group_by_app=cfg.group_by_app,
+                pinned_exes=cfg.pinned_exes,
+                expand_app=same_app,
+            )
+            if not shown:
                 return
 
             if reverse:
-                selected = len(apps) - 1
+                selected = len(shown) - 1
             else:
-                selected = 1 if len(apps) > 1 else 0
-            self.overlay.show(apps, selected=selected, sticky=sticky)
+                selected = 1 if len(shown) > 1 else 0
+            self.overlay.show(
+                apps, selected=selected, sticky=sticky, expand_app=same_app
+            )
 
     @staticmethod
     def _same_app_peers(apps: list) -> list:
@@ -352,6 +371,10 @@ class FunTabApp:
             hwnd = overlay.request_close_selected()
             if hwnd:
                 minimize_window(hwnd)
+        elif kind == hook_actions.HIDE:
+            self._hide_selected_app()
+        elif kind == hook_actions.PIN:
+            self._toggle_pin_selected()
 
     def _close_selected(self) -> None:
         app = self.overlay.selected_app()
@@ -377,6 +400,113 @@ class FunTabApp:
                     "cannot close it.",
                     flags=w.MB_OK | w.MB_ICONWARNING,
                 )
+
+    def _persist_config(self) -> None:
+        self.cfg.save()
+        self._config_stamp = _config_stamp()
+
+    def _hide_selected_app(self) -> None:
+        app = self.overlay.selected_app()
+        if app is None or not app.exe_name:
+            return
+        name = app.exe_name.lower()
+        if name not in self.cfg.exclude_exes:
+            self.cfg.exclude_exes = list(self.cfg.exclude_exes) + [name]
+            self.cfg.clamp()
+            self._persist_config()
+        self.overlay.drop_exe(name)
+
+    def _toggle_pin_selected(self) -> None:
+        app = self.overlay.selected_app()
+        if app is None or not app.exe_name:
+            return
+        name = app.exe_name.lower()
+        pinned = list(self.cfg.pinned_exes)
+        if name in pinned:
+            pinned = [item for item in pinned if item != name]
+        else:
+            pinned.append(name)
+        self.cfg.pinned_exes = pinned
+        self.cfg.clamp()
+        self._persist_config()
+        hwnd = app.hwnd
+        if not self.overlay._query:
+            self.overlay._refresh_visible(keep_hwnd=hwnd)
+
+    def _slice_menu(self) -> None:
+        """Right-click on a slice: hide, pin, close, minimise."""
+        app = self.overlay.selected_app()
+        if app is None or not self.overlay.hwnd:
+            return
+        menu = w.user32.CreatePopupMenu()
+        if not menu:
+            return
+        hide_id, pin_id, close_id, min_id, dismiss_id = 1, 2, 3, 4, 5
+        pinned = app.exe_name.lower() in self.cfg.pinned_exes
+        pin_label = "Unpin this app" if pinned else "Pin this app"
+        self._menu_open = True
+        try:
+            w.user32.AppendMenuW(menu, w.MF_STRING, hide_id, "Hide this app")
+            w.user32.AppendMenuW(menu, w.MF_STRING, pin_id, pin_label)
+            w.user32.AppendMenuW(menu, w.MF_SEPARATOR, 0, None)
+            w.user32.AppendMenuW(menu, w.MF_STRING, close_id, "Close window")
+            w.user32.AppendMenuW(menu, w.MF_STRING, min_id, "Minimise window")
+            w.user32.AppendMenuW(menu, w.MF_SEPARATOR, 0, None)
+            w.user32.AppendMenuW(menu, w.MF_STRING, dismiss_id, "Cancel")
+            point = w.POINT()
+            w.user32.GetCursorPos(ctypes.byref(point))
+            w.user32.SetForegroundWindow(self.overlay.hwnd)
+            choice = int(
+                w.user32.TrackPopupMenu(
+                    menu,
+                    w.TPM_RIGHTBUTTON | w.TPM_RETURNCMD,
+                    point.x,
+                    point.y,
+                    0,
+                    self.overlay.hwnd,
+                    None,
+                )
+            )
+            w.user32.PostMessageW(self.overlay.hwnd, w.WM_NULL, 0, 0)
+        finally:
+            w.user32.DestroyMenu(menu)
+            self._menu_open = False
+        if choice == hide_id:
+            self._hide_selected_app()
+        elif choice == pin_id:
+            self._toggle_pin_selected()
+        elif choice == close_id:
+            self._close_selected()
+        elif choice == min_id:
+            hwnd = self.overlay.request_close_selected()
+            if hwnd:
+                minimize_window(hwnd)
+        elif choice == dismiss_id:
+            self.cancel()
+
+    def toggle_pause(self) -> None:
+        self.set_paused(not self._paused_manually)
+
+    def set_paused(self, paused: bool) -> None:
+        self._paused_manually = bool(paused)
+        if self._paused_manually:
+            self.cancel()
+            if self.hook.installed:
+                self.hook.uninstall()
+        else:
+            self._refresh_compat()
+        if self._tray is not None:
+            self._tray.set_paused(self._paused_manually)
+
+    def show_about(self) -> None:
+        from . import __version__
+
+        w.message_box(
+            f"Fun Tab {__version__}\n\n"
+            "A GTA-style radial Alt+Tab for Windows.\n\n"
+            "Hold your open shortcut, flick the mouse, let go.",
+            flags=w.MB_OK | w.MB_ICONINFORMATION,
+        )
 
     # -- tray --------------------------------------------------------------
 
@@ -429,6 +559,7 @@ class FunTabApp:
                 # the moment they opened, because Alt was never held.
                 if (
                     not self.overlay.sticky
+                    and not self._menu_open
                     and time.perf_counter() - self.overlay._shown_at >= 0.25
                     and self.hook.hold_released()
                 ):

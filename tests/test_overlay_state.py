@@ -44,6 +44,7 @@ def wheel(apps=APPS, selected: int = 0, **overrides) -> Overlay:
     # Previews off by default: capturing fake hwnds would spin up a worker
     # thread for nothing.
     overrides.setdefault("preview_enabled", False)
+    overrides.setdefault("group_by_app", False)
     cfg = Config(**overrides)
     overlay = Overlay(cfg)
     overlay._apply_metrics(96)
@@ -146,6 +147,45 @@ def test_cycle_same_app_does_nothing_for_a_lone_window():
     o = wheel(selected=0)  # Obsidian, only one window
     o.cycle_same_app(1)
     assert o.selected_index == 0
+
+
+def test_grouping_collapses_chrome_into_one_slice():
+    o = wheel(group_by_app=True)
+    o._apps = o._present_apps()
+    assert [a.title for a in o.apps] == ["notes.md", "Inbox", "standup", "Now Playing"]
+    chrome = o.apps[1]
+    assert chrome.group_count == 2
+    assert chrome.peer_hwnds == (2, 3)
+
+
+def test_grouped_backtick_rotates_the_face_without_adding_slices():
+    o = wheel(group_by_app=True)
+    o._apps = o._present_apps()
+    o._selected = 1
+    assert o.selected_app().title == "Inbox"
+    o.cycle_same_app(1)
+    assert o.selected_app().title == "Gmail"
+    assert [a.title for a in o.apps] == ["notes.md", "Gmail", "standup", "Now Playing"]
+    o.cycle_same_app(1)
+    assert o.selected_app().title == "Inbox"
+
+
+def test_search_ungroups_so_a_title_can_be_picked():
+    o = wheel(group_by_app=True)
+    o._apps = o._present_apps()
+    o.type_query("gmail")
+    assert titles(o) == ["Gmail"]
+    o.clear_query()
+    assert [a.title for a in o.apps] == ["notes.md", "Inbox", "standup", "Now Playing"]
+
+
+def test_drop_exe_removes_every_window_of_that_app():
+    o = wheel(group_by_app=True)
+    o._apps = o._present_apps()
+    o._selected = 1
+    assert o.drop_exe("chrome.exe") is True
+    assert all("chrome" not in a.exe_name.lower() for a in o.apps)
+    assert "Inbox" not in titles(o)
 
 
 # -- search ----------------------------------------------------------------

@@ -31,9 +31,11 @@ ICON_GUID = uuid.UUID("6e0f2c4a-8b17-4d9e-9a3c-1b2d3e4f5a60")
 
 _ID_SETTINGS = 1
 _ID_AUTOSTART = 2
-_ID_EDIT = 3
-_ID_RELOAD = 4
-_ID_QUIT = 5
+_ID_PAUSE = 3
+_ID_EDIT = 4
+_ID_RELOAD = 5
+_ID_ABOUT = 6
+_ID_QUIT = 7
 
 
 def _guid() -> w.GUID:
@@ -169,6 +171,18 @@ class TrayIcon:
         demote_notify_icon(sys.executable)
         return True
 
+    def set_paused(self, paused: bool) -> None:
+        """Update the tray tooltip so a paused copy is obvious."""
+        if not self.hwnd:
+            return
+        nid = self._nid(w.NIF_TIP | w.NIF_GUID | w.NIF_SHOWTIP)
+        nid.szTip = "Fun Tab (paused)" if paused else "Fun Tab"
+        if w.shell32.Shell_NotifyIconW(w.NIM_MODIFY, ctypes.byref(nid)):
+            return
+        nid.uFlags &= ~w.NIF_GUID
+        nid.uID = 1
+        w.shell32.Shell_NotifyIconW(w.NIM_MODIFY, ctypes.byref(nid))
+
     def uninstall(self) -> None:
         if self.hwnd:
             nid = self._nid(0)
@@ -206,7 +220,7 @@ class TrayIcon:
         nid.uFlags = flags
         nid.uCallbackMessage = WM_TRAYICON
         nid.hIcon = self._hicon
-        nid.szTip = "Fun Tab"
+        nid.szTip = "Fun Tab (paused)" if getattr(self.app, "_paused_manually", False) else "Fun Tab"
         nid.guidItem = _guid()
         return nid
 
@@ -266,9 +280,14 @@ class TrayIcon:
                 w.MF_CHECKED if autostart.is_enabled() else w.MF_UNCHECKED
             )
             w.user32.AppendMenuW(menu, auto_flags, _ID_AUTOSTART, "Start with Windows")
+            paused = bool(getattr(self.app, "_paused_manually", False))
+            pause_flags = w.MF_STRING | (w.MF_CHECKED if paused else w.MF_UNCHECKED)
+            pause_label = "Resume Fun Tab" if paused else "Pause Fun Tab"
+            w.user32.AppendMenuW(menu, pause_flags, _ID_PAUSE, pause_label)
             w.user32.AppendMenuW(menu, w.MF_STRING, _ID_EDIT, "Edit the settings file")
             w.user32.AppendMenuW(menu, w.MF_STRING, _ID_RELOAD, "Reload settings")
             w.user32.AppendMenuW(menu, w.MF_SEPARATOR, 0, None)
+            w.user32.AppendMenuW(menu, w.MF_STRING, _ID_ABOUT, "About Fun Tab")
             w.user32.AppendMenuW(menu, w.MF_STRING, _ID_QUIT, "Quit Fun Tab")
 
             point = w.POINT()
@@ -295,6 +314,8 @@ class TrayIcon:
             self.app.open_settings_ui()
         elif choice == _ID_AUTOSTART:
             autostart.toggle()
+        elif choice == _ID_PAUSE:
+            self.app.toggle_pause()
         elif choice == _ID_EDIT:
             path = config_path()
             if not path.exists():
@@ -308,5 +329,7 @@ class TrayIcon:
             w.user32.PostThreadMessageW(
                 int(w.kernel32.GetCurrentThreadId()), w.WM_NULL, 0, 0
             )
+        elif choice == _ID_ABOUT:
+            self.app.show_about()
         elif choice == _ID_QUIT:
             self.app.shutdown()

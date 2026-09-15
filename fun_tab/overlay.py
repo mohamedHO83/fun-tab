@@ -32,7 +32,7 @@ from .config import Config, Theme, alpha
 from .config import mix as _mix
 from .gdi import LayeredSurface, ScreenGrabber
 from .wheel import WheelLayout, build_layout, pie_points
-from .windows_enum import AppWindow, capture_thumbnail
+from .windows_enum import AppWindow, capture_thumbnail, group_key, present_windows
 
 RENDER_SCALE = 2
 PREVIEW_FADE = 0.13
@@ -320,7 +320,9 @@ class Overlay:
 
         self._on_commit: Optional[Callable[[], None]] = None
         self._on_cancel: Optional[Callable[[], None]] = None
+        self._on_context: Optional[Callable[[], None]] = None
         self.compat_active = False
+        self._expand_app = False
 
         self._layers: Optional[WheelLayers] = None
         self._layer_cache: OrderedDict[tuple, WheelLayers] = OrderedDict()
@@ -399,10 +401,14 @@ class Overlay:
         return None
 
     def set_callbacks(
-        self, on_commit: Callable[[], None], on_cancel: Callable[[], None]
+        self,
+        on_commit: Callable[[], None],
+        on_cancel: Callable[[], None],
+        on_context: Optional[Callable[[], None]] = None,
     ) -> None:
         self._on_commit = on_commit
         self._on_cancel = on_cancel
+        self._on_context = on_context
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -585,6 +591,14 @@ class Overlay:
                     self._on_commit()
                 return 0
             if msg == w.WM_RBUTTONUP:
+                x, y = _lparam_point(lparam)
+                if self._layers and self._point_on_wheel(x, y):
+                    hit = self._layers.layout.aim(x, y)
+                    if hit is not None:
+                        self.select(hit)
+                        if self._on_context:
+                            self._on_context()
+                            return 0
                 if self._on_cancel:
                     self._on_cancel()
                 return 0
@@ -685,14 +699,24 @@ class Overlay:
 
     # -- show / hide -------------------------------------------------------
 
-    def show(self, apps: list[AppWindow], selected: int = 0, sticky: bool = False) -> None:
+    def show(
+        self,
+        apps: list[AppWindow],
+        selected: int = 0,
+        sticky: bool = False,
+        *,
+        expand_app: bool = False,
+    ) -> None:
         if not apps:
             return
         self._update_monitor()
 
+        self._expand_app = expand_app
         self._all_apps = list(apps)
-        self._apps = list(apps)
-        self._selected = max(0, min(selected, len(apps) - 1))
+        self._apps = self._present_apps()
+        if not self._apps:
+            return
+        self._selected = max(0, min(selected, len(self._apps) - 1))
         self._sticky = sticky
         self._query = ""
         self._query_matched = True
@@ -851,21 +875,96 @@ class Overlay:
     def last(self) -> None:
         self.select(len(self._apps) - 1)
 
+    def _should_group(self) -> bool:
+        return bool(self.cfg.group_by_app) and not self._query and not self._expand_app
+
+    def _present_apps(self, source: list[AppWindow] | None = None) -> list[AppWindow]:
+        apps = list(self._all_apps if source is None else source)
+        if self._query:
+            return apps
+        return present_windows(
+            apps,
+            group_by_app=self._should_group(),
+            pinned_exes=self.cfg.pinned_exes,
+            expand_app=self._expand_app,
+        )
+
+    def _refresh_visible(self, *, keep_hwnd: int = 0) -> bool:
+        """Rebuild the shown list. False if nothing is left (caller should cancel)."""
+        presented = self._present_apps()
+        if not presented:
+            self._apps = []
+            return False
+        self._apps = presented
+        index = 0
+        if keep_hwnd:
+            index = next((i for i, app in enumerate(presented) if app.hwnd == keep_hwnd), 0)
+            if index == 0 and presented[0].hwnd != keep_hwnd:
+                index = next(
+                    (i for i, app in enumerate(presented) if keep_hwnd in app.peer_hwnds),
+                    min(self._selected, len(presented) - 1),
+                )
+        else:
+            index = min(self._selected, len(presented) - 1)
+        self._selected = index
+        self._release_mouse()
+        self._sel_from = -1
+        self._dirty = True
+        self._rebuild_layers()
+        if self.selected_app():
+            self._request_preview(self.selected_app().hwnd, urgent=True)
+        return True
+
+    def drop_exe(self, exe_name: str) -> bool:
+        """Remove every window of an executable from the wheel. False = close it."""
+        name = exe_name.lower()
+        keep = [app for app in self._all_apps if app.exe_name.lower() != name]
+        self._all_apps = keep
+        if not keep:
+            if self._on_cancel:
+                self._on_cancel()
+            return False
+        hwnd = self.selected_app().hwnd if self.selected_app() else 0
+        if not self._refresh_visible(keep_hwnd=hwnd):
+            if self._on_cancel:
+                self._on_cancel()
+            return False
+        return True
+
     def cycle_same_app(self, delta: int) -> None:
         """Move to the next window belonging to the same application."""
         current = self.selected_app()
         if current is None:
             return
-        key = current.exe_path or current.class_name
-        peers = [
-            i
-            for i, app in enumerate(self._apps)
-            if (app.exe_path or app.class_name) == key
-        ]
+        key = group_key(current)
+        visible = [i for i, app in enumerate(self._apps) if group_key(app) == key]
+        if len(visible) >= 2:
+            position = visible.index(self._selected) if self._selected in visible else 0
+            self.select(visible[(position + delta) % len(visible)])
+            return
+        peers = [app for app in self._all_apps if group_key(app) == key]
         if len(peers) < 2:
             return
-        position = peers.index(self._selected) if self._selected in peers else 0
-        self.select(peers[(position + delta) % len(peers)])
+        index = next((i for i, app in enumerate(peers) if app.hwnd == current.hwnd), 0)
+        nxt = peers[(index + delta) % len(peers)]
+        self._bring_peer_to_front(nxt)
+        self._refresh_visible(keep_hwnd=nxt.hwnd)
+
+    def _bring_peer_to_front(self, face: AppWindow) -> None:
+        """Make ``face`` the representative of its application group."""
+        key = group_key(face)
+        rebuilt: list[AppWindow] = []
+        seen: set[str] = set()
+        for app in self._all_apps:
+            item_key = group_key(app)
+            if item_key in seen:
+                continue
+            seen.add(item_key)
+            members = [item for item in self._all_apps if group_key(item) == item_key]
+            if item_key == key:
+                members = [face] + [item for item in members if item.hwnd != face.hwnd]
+            rebuilt.extend(members)
+        self._all_apps = rebuilt
 
     # -- search ------------------------------------------------------------
 
@@ -883,16 +982,17 @@ class Overlay:
     def _set_query(self, text: str) -> None:
         self._query = text
         keep_hwnd = self.selected_app().hwnd if self.selected_app() else 0
+        source = list(self._all_apps)
 
         if text:
             needle = text.lower()
             matches = [
                 a
-                for a in self._all_apps
+                for a in source
                 if a.matches_query(needle, title_privacy=self.cfg.title_privacy)
             ]
         else:
-            matches = list(self._all_apps)
+            matches = None
 
         self._query_matched = bool(matches) or not text
         self._release_mouse()
@@ -902,6 +1002,18 @@ class Overlay:
                 (i for i, a in enumerate(self._apps) if a.hwnd == keep_hwnd), 0
             )
             self._selected = index
+        elif not text:
+            self._apps = self._present_apps()
+            if self._apps:
+                index = next(
+                    (i for i, a in enumerate(self._apps) if a.hwnd == keep_hwnd), 0
+                )
+                if index == 0 and self._apps[0].hwnd != keep_hwnd:
+                    index = next(
+                        (i for i, a in enumerate(self._apps) if keep_hwnd in a.peer_hwnds),
+                        0,
+                    )
+                self._selected = min(index, len(self._apps) - 1)
         # No match: keep showing the previous set and flag the query instead of
         # blanking the wheel under the user's fingers.
 
@@ -919,19 +1031,33 @@ class Overlay:
         if app is None:
             return 0
         hwnd = app.hwnd
+        key = group_key(app)
         self._all_apps = [a for a in self._all_apps if a.hwnd != hwnd]
-        remaining = [a for a in self._apps if a.hwnd != hwnd]
-        if not remaining:
+        self._drop_thumb(hwnd)
+        if not self._all_apps:
             if self._on_cancel:
                 self._on_cancel()
             return hwnd
-        self._apps = remaining
-        self._selected = min(self._selected, len(remaining) - 1)
-        self._release_mouse()
-        self._sel_from = -1
-        self._drop_thumb(hwnd)
-        self._dirty = True
-        self._rebuild_layers()
+        if self._query:
+            remaining = [a for a in self._apps if a.hwnd != hwnd]
+            if not remaining:
+                if self._on_cancel:
+                    self._on_cancel()
+                return hwnd
+            self._apps = remaining
+            self._selected = min(self._selected, len(remaining) - 1)
+            self._release_mouse()
+            self._sel_from = -1
+            self._dirty = True
+            self._rebuild_layers()
+            return hwnd
+        keep = 0
+        peer = next((a for a in self._all_apps if group_key(a) == key), None)
+        if peer is not None:
+            keep = peer.hwnd
+        if not self._refresh_visible(keep_hwnd=keep):
+            if self._on_cancel:
+                self._on_cancel()
         return hwnd
 
     # -- previews ----------------------------------------------------------
@@ -1690,11 +1816,13 @@ class Overlay:
             app.subtitle if self.cfg.title_privacy == "full" else "",
             app.minimized,
             app.maximized,
+            app.group_count,
             self._query,
             self._query_matched,
             self.compat_active,
             self.cfg.open_hotkey,
             self.cfg.title_privacy,
+            self.cfg.group_by_app,
         )
         cached = self._label_cache.get(key)
         if cached is not None:
@@ -1735,6 +1863,8 @@ class Overlay:
                 parts.append("minimised")
             elif app.maximized:
                 parts.append("maximised")
+            if app.group_count > 1:
+                parts.append(f"{app.group_count} windows")
             line = _ellipsize(draw, "  ·  ".join(parts), sub_font, max_width)
             if line:
                 _centered(draw, line, centre, y, sub_font, theme.text_dim)
@@ -1750,6 +1880,8 @@ class Overlay:
             from .hotkey import parse_hotkey
 
             hint = f"{parse_hotkey(self.cfg.open_hotkey).label()} · type to search · Esc cancel"
+            if app.group_count > 1:
+                hint = f"{parse_hotkey(self.cfg.open_hotkey).label()} · ` next window · Esc cancel"
             _centered(
                 draw,
                 _ellipsize(draw, hint, hint_font, max_width),

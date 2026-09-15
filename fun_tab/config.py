@@ -130,8 +130,12 @@ class Config:
     # Ask before posting WM_CLOSE from Delete / Ctrl+W (once per session after Yes).
     close_confirm: bool = True
     minimized_last: bool = False
+    # One slice per application; ` cycles that app's windows. Off = every window.
+    group_by_app: bool = True
     exclude_exes: list[str] = field(default_factory=list)
     exclude_titles: list[str] = field(default_factory=list)
+    # Executable names kept near the front of the wheel (after the current app).
+    pinned_exes: list[str] = field(default_factory=list)
 
     # One toggle that forces the privacy preset (see privacy.apply_privacy_bundle).
     privacy_mode: bool = False
@@ -246,6 +250,10 @@ class Config:
         self.open_hotkey = parse_hotkey(self.open_hotkey).text()
         if self.privacy_mode:
             apply_privacy_bundle(self)
+        self.exclude_exes = _normalize_exe_names(self.exclude_exes)
+        self.pinned_exes = _normalize_exe_names(self.pinned_exes)
+        blocked = set(self.exclude_exes)
+        self.pinned_exes = [name for name in self.pinned_exes if name not in blocked]
 
 
 def _coerce(annotation: Any, value: Any) -> Any:
@@ -267,6 +275,23 @@ def _coerce(annotation: Any, value: Any) -> Any:
 
 def _clampf(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
+
+
+def _normalize_exe_names(names: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Lowercase basenames, with a trailing .exe, de-duplicated and in order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in names or ():
+        name = os.path.basename(str(raw).strip().strip('"')).lower()
+        if not name:
+            continue
+        if not name.endswith(".exe"):
+            name += ".exe"
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
 
 
 # ---------------------------------------------------------------------------
