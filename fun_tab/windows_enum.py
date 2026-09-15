@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image
 
 from . import win32_types as w
+from .privacy import excluded_exes
 
 ICON_PX = 96
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
@@ -78,6 +79,21 @@ class AppWindow:
     @property
     def search_text(self) -> str:
         return f"{self.title} {self.app_name} {self.exe_name}".lower()
+
+    def label(self, *, title_privacy: str = "full") -> str:
+        """What the hub / preview should show for this window."""
+        if title_privacy == "app":
+            return (self.app_name or self.exe_name or self.display_name).strip()
+        return self.display_name
+
+    def matches_query(self, needle: str, *, title_privacy: str = "full") -> bool:
+        if not needle:
+            return True
+        if title_privacy == "app":
+            hay = f"{self.app_name} {self.exe_name}".lower()
+        else:
+            hay = self.search_text
+        return needle in hay
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +426,7 @@ def enumerate_windows(
         exclude.add(int(self_hwnd))
     exclude.discard(0)
 
-    blocked_exes = {e.lower() for e in exclude_exes if e}
+    blocked_exes = excluded_exes(exclude_exes)
     blocked_titles = [t.lower() for t in exclude_titles if t]
 
     hwnds: list[int] = []
@@ -493,10 +509,24 @@ def activate_window(hwnd: int) -> bool:
     if w.user32.IsIconic(hwnd):
         w.user32.ShowWindow(hwnd, w.SW_RESTORE)
 
+    pid = wintypes.DWORD()
+    w.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    target_pid = int(pid.value or 0)
+
+    # Prefer SwitchToThisWindow — it is the shell-approved path and does not
+    # open the session-wide ASFW_ANY hole.
     try:
-        w.user32.AllowSetForegroundWindow(w.ASFW_ANY)
+        w.user32.SwitchToThisWindow(hwnd, True)
     except OSError:
         pass
+    if int(w.user32.GetForegroundWindow() or 0) == hwnd:
+        return True
+
+    if target_pid:
+        try:
+            w.user32.AllowSetForegroundWindow(target_pid)
+        except OSError:
+            pass
 
     fg = w.user32.GetForegroundWindow()
     if fg == hwnd:
@@ -527,8 +557,6 @@ def activate_window(hwnd: int) -> bool:
     if int(w.user32.GetForegroundWindow() or 0) == hwnd:
         return True
 
-    # Last resort: the shell's own switcher path, which the foreground-lock
-    # rules explicitly permit.
     try:
         w.user32.SwitchToThisWindow(hwnd, True)
     except OSError:
@@ -536,14 +564,31 @@ def activate_window(hwnd: int) -> bool:
     return int(w.user32.GetForegroundWindow() or 0) == hwnd
 
 
-def close_window(hwnd: int) -> None:
-    if hwnd and w.user32.IsWindow(hwnd):
-        w.user32.PostMessageW(hwnd, w.WM_CLOSE, 0, 0)
+def close_window(hwnd: int) -> bool:
+    """Ask a window to close. False when we should not touch it (e.g. elevated)."""
+    if not hwnd or not w.user32.IsWindow(hwnd):
+        return False
+    if window_is_elevated(hwnd):
+        return False
+    w.user32.PostMessageW(hwnd, w.WM_CLOSE, 0, 0)
+    return True
 
 
-def minimize_window(hwnd: int) -> None:
-    if hwnd and w.user32.IsWindow(hwnd):
-        w.user32.ShowWindow(hwnd, w.SW_SHOWMINNOACTIVE)
+def minimize_window(hwnd: int) -> bool:
+    if not hwnd or not w.user32.IsWindow(hwnd):
+        return False
+    if window_is_elevated(hwnd):
+        return False
+    w.user32.ShowWindow(hwnd, w.SW_SHOWMINNOACTIVE)
+    return True
+
+
+def window_is_elevated(hwnd: int) -> bool:
+    if not hwnd:
+        return False
+    pid = wintypes.DWORD()
+    w.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return w.process_is_elevated(int(pid.value or 0))
 
 
 def foreground_hwnd() -> int:
@@ -693,6 +738,10 @@ def capture_thumbnail(
     window — including our own overlay.
     """
     if not hwnd or not w.user32.IsWindow(hwnd):
+        return None
+    if w.window_excludes_capture(hwnd):
+        return None
+    if window_is_elevated(hwnd):
         return None
 
     if w.user32.IsIconic(hwnd):

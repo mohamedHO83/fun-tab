@@ -2,25 +2,15 @@
 
 from __future__ import annotations
 
-import sys
 import winreg
 from pathlib import Path
 
 from .config import config_dir
+from .paths import frozen, install_dir, launcher
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "FunTab"
 LAUNCHER = "fun-tab-autostart.pyw"
-
-
-def _pythonw() -> Path:
-    exe = Path(sys.executable)
-    windowed = exe.with_name("pythonw.exe")
-    return windowed if windowed.exists() else exe
-
-
-def _project_root() -> Path:
-    return Path(__file__).resolve().parent.parent
 
 
 def _write_launcher() -> Path:
@@ -29,7 +19,7 @@ def _write_launcher() -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "import sys\n"
-        f"sys.path.insert(0, r{str(_project_root())!r})\n"
+        f"sys.path.insert(0, r{str(install_dir())!r})\n"
         "from fun_tab.app import main\n"
         "raise SystemExit(main())\n",
         encoding="utf-8",
@@ -38,7 +28,10 @@ def _write_launcher() -> Path:
 
 
 def command() -> str:
-    return f'"{_pythonw()}" "{_write_launcher()}"'
+    exe = launcher()
+    if frozen():
+        return f'"{exe}"'
+    return f'"{exe}" "{_write_launcher()}"'
 
 
 def is_enabled() -> bool:

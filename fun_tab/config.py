@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 from . import win32_types as w
+from .privacy import CONSENT_VERSION, apply_privacy_bundle
 
 RGBA = tuple[int, int, int, int]
 
@@ -25,6 +27,44 @@ def config_dir() -> Path:
 
 def config_path() -> Path:
     return config_dir() / "config.json"
+
+
+def _is_unsafe_config_path(path: Path) -> bool:
+    """Refuse to follow a config that has been redirected via symlink."""
+    try:
+        if path.is_symlink():
+            return True
+        parent = path.parent
+        if parent.exists() and parent.is_symlink():
+            return True
+    except OSError:
+        return True
+    return False
+
+
+def _ensure_private_dir(path: Path) -> None:
+    """Create the config folder and try to lock it to the current user."""
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        import subprocess
+
+        user = os.environ.get("USERNAME") or os.getlogin()
+        subprocess.run(
+            [
+                "icacls",
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"{user}:(OI)(CI)F",
+                "/grant:r",
+                "SYSTEM:(OI)(CI)F",
+            ],
+            check=False,
+            capture_output=True,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+    except OSError:
+        pass
 
 
 @dataclass
@@ -56,7 +96,7 @@ class Config:
     dim_blur: float = 1.0  # 0 = sharp desktop, 1 = fully soft
     dim_veil: int = 40  # extra darkening, 0-255
     dim_scale: int = 6  # capture/blur at 1/N resolution
-    backdrop_ttl: float = 2.0  # reuse a captured plate for this long
+    backdrop_ttl: float = 0.5  # reuse a captured plate for this long
 
     # --- preview card -----------------------------------------------------
     preview_enabled: bool = True
@@ -64,8 +104,10 @@ class Config:
     preview_width: int = 400
     preview_height: int = 225
     preview_margin: int = 48
-    prefetch_previews: bool = True
-    capture_minimized: bool = True
+    # Off by default: do not PrintWindow windows the user is not looking at.
+    prefetch_previews: bool = False
+    # Off by default: never restore a minimised window off-screen to photograph it.
+    capture_minimized: bool = False
     thumb_ttl: float = 4.0  # seconds a captured thumbnail is reused before refresh
 
     # --- aiming -----------------------------------------------------------
@@ -76,6 +118,8 @@ class Config:
     show_counter: bool = True
     show_subtitle: bool = True
     show_hints: bool = True
+    # full = window title; app = application name only (hides docs / URLs).
+    title_privacy: str = "full"
 
     # --- behaviour --------------------------------------------------------
     mru_order: bool = True
@@ -83,9 +127,14 @@ class Config:
     digit_jump: bool = True
     wrap_navigation: bool = True
     close_key_enabled: bool = True
+    # Ask before posting WM_CLOSE from Delete / Ctrl+W (once per session after Yes).
+    close_confirm: bool = True
     minimized_last: bool = False
     exclude_exes: list[str] = field(default_factory=list)
     exclude_titles: list[str] = field(default_factory=list)
+
+    # One toggle that forces the privacy preset (see privacy.apply_privacy_bundle).
+    privacy_mode: bool = False
 
     # off     - always take over Alt+Tab
     # always  - never take over Alt+Tab; open with Ctrl+Alt+Tab
@@ -104,6 +153,9 @@ class Config:
     # That is the strongest anti-cheat-friendly option short of quitting.
     pause_in_games: bool = True
 
+    # First-run disclosure; bumped in privacy.CONSENT_VERSION when the text changes.
+    consent_version: int = 0
+
     # --- raw colour overrides (theme key -> "#RRGGBB" or [r,g,b,a]) -------
     colors: dict[str, Any] = field(default_factory=dict)
 
@@ -111,6 +163,8 @@ class Config:
     def load(cls, path: Path | None = None) -> "Config":
         path = path or config_path()
         cfg = cls()
+        if _is_unsafe_config_path(path):
+            return cfg
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -132,11 +186,24 @@ class Config:
 
     def save(self, path: Path | None = None) -> bool:
         path = path or config_path()
+        if _is_unsafe_config_path(path):
+            return False
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(asdict(self), indent=2, sort_keys=False), encoding="utf-8"
+            _ensure_private_dir(path.parent)
+            payload = json.dumps(asdict(self), indent=2, sort_keys=False)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix="config.", suffix=".tmp", dir=str(path.parent)
             )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                os.replace(tmp_name, path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
             return True
         except OSError:
             return False
@@ -157,6 +224,7 @@ class Config:
         self.preview_height = int(_clampf(self.preview_height, 90, 800))
         self.preview_margin = int(_clampf(self.preview_margin, 0, 400))
         self.thumb_ttl = _clampf(self.thumb_ttl, 0.0, 3600.0)
+        self.consent_version = int(_clampf(self.consent_version, 0, 10_000))
         if self.theme not in ("auto", "dark", "light"):
             self.theme = "auto"
         # Names from older configs, kept working so an upgrade does not land
@@ -171,9 +239,13 @@ class Config:
             self.backdrop = "blur"
         if self.game_compat not in ("auto", "always", "off"):
             self.game_compat = "auto"
+        if self.title_privacy not in ("full", "app"):
+            self.title_privacy = "full"
         from .hotkey import parse_hotkey
 
         self.open_hotkey = parse_hotkey(self.open_hotkey).text()
+        if self.privacy_mode:
+            apply_privacy_bundle(self)
 
 
 def _coerce(annotation: Any, value: Any) -> Any:
@@ -342,3 +414,16 @@ def _ensure_readable(rgb: tuple[int, int, int], dark: bool) -> RGBA:
         t = (luma - 0.72) / 0.28
         r, g, b = (int(c * (1 - t * 0.5)) for c in (r, g, b))
     return (r, g, b, 255)
+
+
+# Re-export so callers that only import config can see the current consent bar.
+__all__ = [
+    "Config",
+    "Theme",
+    "RGBA",
+    "alpha",
+    "config_dir",
+    "config_path",
+    "mix",
+    "CONSENT_VERSION",
+]

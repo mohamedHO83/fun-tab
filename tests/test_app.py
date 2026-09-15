@@ -7,9 +7,11 @@ the file. If this stops working, saving looks like it did nothing.
 from __future__ import annotations
 
 import json
+import sys
 
-from fun_tab.app import FunTabApp, _config_stamp
+from fun_tab.app import FunTabApp, _config_stamp, main
 from fun_tab.config import Config
+from fun_tab import win32_types as w
 
 
 def test_a_missing_file_has_no_stamp(tmp_path):
@@ -173,3 +175,89 @@ def test_rewriting_the_same_settings_is_not_a_change(tmp_path):
     before = _config_stamp(path)
     Config(theme="light").save(path)
     assert _config_stamp(path) == before
+
+
+def test_settings_flag_skips_the_switcher(monkeypatch):
+    """A packed exe launches settings as FunTab.exe --settings, not a second hook."""
+    called = []
+    monkeypatch.setattr(sys, "argv", ["FunTab.exe", "--settings"])
+    monkeypatch.setattr("fun_tab.settings_ui.main", lambda: called.append(True) or 0)
+    assert main() == 0
+    assert called == [True]
+
+
+def test_close_selected_asks_once_per_session(monkeypatch):
+    from fun_tab.app import FunTabApp
+    from fun_tab.windows_enum import AppWindow
+
+    app = FunTabApp()
+    app.cfg.close_confirm = True
+    target = AppWindow(
+        hwnd=9,
+        title="Notes",
+        class_name="Notepad",
+        pid=1,
+        app_name="Notepad",
+    )
+    app.overlay._visible = True
+    app.overlay._apps = [target]
+    app.overlay._all_apps = [target]
+    app.overlay._selected = 0
+
+    asked = []
+    closed = []
+
+    monkeypatch.setattr(
+        w,
+        "message_box",
+        lambda text, title="Fun Tab", flags=0: asked.append(text) or w.IDYES,
+    )
+    monkeypatch.setattr(
+        "fun_tab.app.close_window",
+        lambda hwnd: closed.append(hwnd) or True,
+    )
+
+    app._close_selected()
+    assert len(asked) == 1
+    assert closed == [9]
+    assert app._close_confirmed_session is True
+
+    # Second close skips the prompt.
+    app.overlay._apps = [target]
+    app.overlay._all_apps = [target]
+    app.overlay._selected = 0
+    app.overlay._visible = True
+    app._close_selected()
+    assert len(asked) == 1
+    assert closed == [9, 9]
+
+
+def test_ensure_consent_accepts_and_persists(tmp_path, monkeypatch):
+    from fun_tab.app import _ensure_consent
+    from fun_tab.privacy import CONSENT_VERSION
+
+    path = tmp_path / "config.json"
+    monkeypatch.setattr("fun_tab.app.config_path", lambda: path)
+    monkeypatch.setattr("fun_tab.config.config_path", lambda: path)
+    monkeypatch.setattr(
+        w,
+        "message_box",
+        lambda text, title="Fun Tab", flags=0: w.IDOK,
+    )
+    assert _ensure_consent() is True
+    assert Config.load(path).consent_version == CONSENT_VERSION
+
+
+def test_ensure_consent_cancel_aborts(tmp_path, monkeypatch):
+    from fun_tab.app import _ensure_consent
+
+    path = tmp_path / "config.json"
+    monkeypatch.setattr("fun_tab.app.config_path", lambda: path)
+    monkeypatch.setattr("fun_tab.config.config_path", lambda: path)
+    Config(consent_version=0).save(path)
+    monkeypatch.setattr(
+        w,
+        "message_box",
+        lambda text, title="Fun Tab", flags=0: w.IDCANCEL,
+    )
+    assert _ensure_consent() is False

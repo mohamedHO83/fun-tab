@@ -11,6 +11,7 @@ import time
 from . import hook as hook_actions
 from . import win32_types as w
 from .config import Config, config_path
+from .privacy import CONSENT_TEXT, CONSENT_VERSION
 from .hook import AltTabHook
 from .mru import ForegroundTracker
 from .overlay import Overlay
@@ -65,6 +66,8 @@ class FunTabApp:
         self._compat_latched = False
         self._paused_for_game = False
         self._resume_hooks_at = 0.0
+        # After the user confirms one close this session, skip further prompts.
+        self._close_confirmed_session = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -216,8 +219,8 @@ class FunTabApp:
         ours belongs to the keyboard hook.
         """
         import subprocess
-        from pathlib import Path
 
+        from .paths import install_dir, settings_command
         from .settings_ui import WINDOW_TITLE
 
         existing = w.user32.FindWindowW(None, WINDOW_TITLE)
@@ -227,12 +230,10 @@ class FunTabApp:
         if self._settings_proc is not None and self._settings_proc.poll() is None:
             return  # starting up, window not there yet
 
-        exe = Path(sys.executable)
-        windowless = exe.with_name("pythonw.exe")
         try:
             self._settings_proc = subprocess.Popen(
-                [str(windowless if windowless.exists() else exe), "-m", "fun_tab.settings_ui"],
-                cwd=str(Path(__file__).resolve().parent.parent),
+                settings_command(),
+                cwd=str(install_dir()),
                 creationflags=0x08000000,  # CREATE_NO_WINDOW
             )
         except OSError:
@@ -346,14 +347,36 @@ class FunTabApp:
             if overlay.jump(int(value)):
                 self.commit()
         elif kind == hook_actions.CLOSE:
-            hwnd = overlay.request_close_selected()
-            if hwnd:
-                close_window(hwnd)
-                self.tracker.forget(hwnd)
+            self._close_selected()
         elif kind == hook_actions.MINIMIZE:
             hwnd = overlay.request_close_selected()
             if hwnd:
                 minimize_window(hwnd)
+
+    def _close_selected(self) -> None:
+        app = self.overlay.selected_app()
+        if app is None:
+            return
+        if self.cfg.close_confirm and not self._close_confirmed_session:
+            title = app.label(title_privacy=self.cfg.title_privacy)
+            question = (
+                f"Close “{title}”?\n\n"
+                "Further closes this session will not ask again."
+            )
+            flags = w.MB_YESNO | w.MB_ICONQUESTION
+            if w.message_box(question, flags=flags) != w.IDYES:
+                return
+            self._close_confirmed_session = True
+        hwnd = self.overlay.request_close_selected()
+        if hwnd:
+            if close_window(hwnd):
+                self.tracker.forget(hwnd)
+            else:
+                w.message_box(
+                    "That window belongs to an elevated app, so Fun Tab "
+                    "cannot close it.",
+                    flags=w.MB_OK | w.MB_ICONWARNING,
+                )
 
     # -- tray --------------------------------------------------------------
 
@@ -414,8 +437,6 @@ class FunTabApp:
                     self.overlay.pump_idle()
             else:
                 self._refresh_compat()
-                if self._tray is not None:
-                    self._tray.try_promote()
 
         self.hook.uninstall()
         self.tracker.uninstall()
@@ -428,6 +449,12 @@ class FunTabApp:
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["--settings"]:
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        from .settings_ui import main as settings_main
+
+        return settings_main()
+
     w.enable_dpi_awareness()
     _hide_console()
 
@@ -436,6 +463,11 @@ def main() -> int:
         from .tray import offer_to_quit_running
 
         return offer_to_quit_running()
+
+    if not _ensure_consent():
+        if mutex:
+            w.kernel32.CloseHandle(mutex)
+        return 0
 
     app = FunTabApp()
     try:
@@ -446,6 +478,19 @@ def main() -> int:
         if mutex:
             w.kernel32.CloseHandle(mutex)
     return 0
+
+
+def _ensure_consent() -> bool:
+    """First-run disclosure. False means the user cancelled."""
+    cfg = Config.load()
+    if cfg.consent_version >= CONSENT_VERSION:
+        return True
+    flags = w.MB_OKCANCEL | w.MB_ICONINFORMATION
+    if w.message_box(CONSENT_TEXT, flags=flags) != w.IDOK:
+        return False
+    cfg.consent_version = CONSENT_VERSION
+    cfg.save()
+    return True
 
 
 if __name__ == "__main__":

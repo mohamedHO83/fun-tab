@@ -40,7 +40,7 @@ class Setting:
     invert: bool = False  # if True, slider is displayed inverted (high=good)
 
 
-GROUPS = ("Look", "Background", "Aiming", "Windows")
+GROUPS = ("Look", "Background", "Aiming", "Windows", "Privacy")
 
 SETTINGS: tuple[Setting, ...] = (
     # -- Look ---------------------------------------------------------------
@@ -158,6 +158,12 @@ SETTINGS: tuple[Setting, ...] = (
     Setting(
         "close_key_enabled", "Let Delete and Ctrl+W close a window", "check", "Windows"
     ),
+    Setting(
+        "close_confirm",
+        "Ask before closing a window the first time each session",
+        "check",
+        "Windows",
+    ),
     Setting("preview_enabled", "Show a picture of the selected window", "check", "Windows"),
     Setting(
         "preview_position",
@@ -173,7 +179,37 @@ SETTINGS: tuple[Setting, ...] = (
         ),
     ),
     Setting(
-        "capture_minimized", "Include minimised windows in that picture", "check", "Windows"
+        "prefetch_previews",
+        "Capture other windows in the background too",
+        "check",
+        "Windows",
+        hint="Off by default. When on, Fun Tab photographs nearby windows before you select them.",
+    ),
+    Setting(
+        "capture_minimized",
+        "Include minimised windows in that picture",
+        "check",
+        "Windows",
+        hint="Off by default. When on, Fun Tab briefly restores the window off-screen to photograph it.",
+    ),
+    # -- Privacy ------------------------------------------------------------
+    Setting(
+        "privacy_mode",
+        "Privacy mode",
+        "check",
+        "Privacy",
+        hint="Turns off previews, prefetch, minimised capture, and close keys; shows app names only; darkens the desktop heavily.",
+    ),
+    Setting(
+        "title_privacy",
+        "Window labels",
+        "choice",
+        "Privacy",
+        choices=(
+            ("full", "Show the full window title"),
+            ("app", "Show the application name only"),
+        ),
+        hint="App-only hides document names, URLs and email subjects on the wheel.",
     ),
 )
 
@@ -352,9 +388,9 @@ class SettingsWindow:
         return max(1, int(round(value * self.ui)))
 
     def _set_icon(self) -> None:
-        from pathlib import Path
+        from .paths import asset_path
 
-        icon = Path(__file__).resolve().parent.parent / "assets" / "fun-tab.ico"
+        icon = asset_path("fun-tab.ico")
         if icon.exists():
             try:
                 self.root.iconbitmap(str(icon))

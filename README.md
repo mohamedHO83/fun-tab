@@ -6,14 +6,28 @@ It replaces the Windows switcher while it runs, and it is built to be faster tha
 
 ![Fun Tab wheel](assets/fun-tab-open.png)
 
-Requires **Windows 10 or 11** and **Python 3.10+**.
+Requires **Windows 10 or 11**. Other people do not need Python.
+
+### Give it to people
+
+On a machine that has Python 3.10+:
+
+```bat
+build.bat
+```
+
+That writes `dist\FunTab.zip`. They unzip it and double-click **FunTab.exe**. Keep the `_internal` folder next to the exe — it is not optional. The first start can trip SmartScreen because the exe is unsigned; *More info* → *Run anyway*.
+
+A tray icon appears (look behind the **^** arrow on the taskbar if Windows hid it). Click it for **Settings**, or quit from there when you're done. Running Fun Tab again also asks whether to quit, which is the way out if the icon is missing. `install_desktop_shortcut.bat` puts a shortcut on the desktop (the packed exe if you have built it, otherwise the source launcher).
+
+### Run from source
 
 ```bat
 pip install -r requirements.txt
 run.bat
 ```
 
-A tray icon appears (look behind the **^** arrow on the taskbar if Windows hid it). Click it for **Settings**, or quit from there when you're done. Running Fun Tab again also asks whether to quit, which is the way out if the icon is missing. `install_desktop_shortcut.bat` puts a shortcut on the desktop.
+`run.bat` installs those packages if they are missing, then starts the tray app. This is the developer path, not the copy you hand out.
 
 ## Controls
 
@@ -111,35 +125,39 @@ Everything still lives in `%APPDATA%\fun-tab\config.json`, written with defaults
 | `transition_duration` | `0.13` | Seconds for the selection crossfade |
 | `max_fps` | `144` | Frame cap while the wheel is open |
 | `dim_blur`, `dim_veil`, `dim_scale` | `1.0`, `40`, `6` | Backdrop softness, darkening, and capture resolution divisor |
-| `backdrop_ttl` | `2.0` | Seconds a captured backdrop is reused before it's grabbed again |
+| `backdrop_ttl` | `0.5` | Seconds a captured backdrop is reused before it's grabbed again |
 | `preview_enabled` | `true` | The live preview card |
 | `preview_position` | `"top-left"` | `top`/`bottom` + `left`/`right`/`center` |
 | `preview_width`, `preview_height`, `preview_margin` | `400`, `225`, `48` | Card size and screen inset |
-| `prefetch_previews` | `true` | Capture the other windows in the background too |
-| `capture_minimized` | `true` | Restore minimised windows off-screen to preview them |
+| `prefetch_previews` | `false` | Capture other windows in the background too |
+| `capture_minimized` | `false` | Restore minimised windows off-screen to preview them |
 | `thumb_ttl` | `4.0` | Seconds before a captured preview is refreshed |
 | `aim_needle` | `true` | The needle in the hub showing which way you're aiming |
 | `aim_origin` | `true` | The ring marking the spot your aim is measured from |
 | `show_counter`, `show_subtitle`, `show_hints` | `true` | Hub text: `n/N`, app name, key hints |
+| `title_privacy` | `"full"` | `full` shows window titles; `app` shows application names only |
+| `privacy_mode` | `false` | Forces the privacy preset (no previews/prefetch/minimised capture/close keys; app labels) |
 | `mru_order` | `true` | Most-recently-used ordering |
 | `search_enabled`, `digit_jump`, `close_key_enabled` | `true` | Turn off the typing, number and close bindings |
+| `close_confirm` | `true` | Ask before the first Delete/Ctrl+W close each session |
 | `wrap_navigation` | `true` | Cycling past the end wraps around |
 | `minimized_last` | `false` | Push minimised windows to the end of the wheel |
-| `exclude_exes` | `[]` | e.g. `["teams.exe"]` - never show these |
+| `exclude_exes` | `[]` | e.g. `["teams.exe"]` - never show these (password managers are always excluded) |
 | `exclude_titles` | `[]` | Substring match on window titles |
 | `open_hotkey` | `"alt+tab"` | Open chord: `alt+tab`, `ctrl+alt+tab`, `mouse4`, `ctrl+mouse5`, … |
 | `open_sticky` | `false` | Keep the wheel open after releasing the open shortcut |
 | `pause_in_games` | `true` | Uninstall input hooks while a game is in front (strongest anti-cheat option short of quitting) |
 | `game_compat` | `"auto"` | `auto` steps aside when a game is in front, `always` always leaves plain Alt+Tab alone, `off` takes Alt+Tab when that is the open shortcut |
 | `game_exes` | `[]` | Extra executable names auto-mode treats as games |
+| `consent_version` | `0` | First-run disclosure; bumped when the consent text changes |
 | `colors` | `{}` | Override any palette key, e.g. `{"accent": "#ff8800", "text": "#ffffff"}` |
 
 ## Tray menu
 
-Windows 11 often hides a new icon behind the **^** arrow next to the clock. Fun Tab asks Windows to pin it, and shows a balloon the first time it starts.
+Windows 11 often hides a new icon behind the **^** arrow next to the clock. Fun Tab leaves it there and shows a balloon the first time it starts.
 
 - **Settings…** - the settings window, with the live preview (also a left click)
-- **Start with Windows** - adds a `pythonw` launcher to the per-user Run key
+- **Start with Windows** - adds Fun Tab to the per-user Run key (`FunTab.exe` from a packed build, or a `pythonw` shim from source)
 - **Edit the settings file** - opens `config.json` for the keys the window doesn't show
 - **Reload settings** - forces a reload; saving already does this on its own
 - **Quit Fun Tab**
@@ -149,6 +167,7 @@ If the icon is missing, run Fun Tab again and choose **Yes** when it asks to qui
 ## Development
 
 ```bat
+build.bat                   # dist\FunTab\FunTab.exe and dist\FunTab.zip
 python -m pytest            # tests, no display needed
 python bench.py             # render timings, cold and warm
 python smoke.py             # creates real layered windows and times a live open

@@ -2,8 +2,9 @@
 
 pystray adds the icon from a helper thread. ``Shell_NotifyIcon(NIM_ADD)`` then
 often fails silently, which is how Fun Tab can own Alt+Tab with no way to
-quit. This module talks to the shell from the UI thread, keeps a stable GUID
-so Windows 11 can remember the icon, and promotes it out of the overflow.
+quit. This module talks to the shell from the UI thread and keeps a stable
+GUID so Windows 11 can remember the icon. The overflow is left alone: Fun Tab
+does not pin itself next to the clock.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from pathlib import Path
 from . import autostart
 from . import win32_types as w
 from .config import config_path
+from .paths import asset_path
 
 HOST_CLASS = "FunTabHostClass"
 HOST_TITLE = "Fun Tab Host"
@@ -77,13 +79,13 @@ def offer_to_quit_running() -> int:
         return 0
     w.message_box(
         "Could not reach the running copy.\n\n"
-        "Open Task Manager, end pythonw.exe (or Python), then start Fun Tab again."
+        f"Open Task Manager, end {Path(sys.executable).name}, then start Fun Tab again."
     )
     return 1
 
 
-def promote_notify_icon(executable: str) -> bool:
-    """Ask Windows 11 to pin our tray icon next to the clock, not under ^."""
+def demote_notify_icon(executable: str) -> bool:
+    """Clear a leftover pin so the icon can sit under ^ like anything else."""
     import winreg
 
     exe = os.path.normcase(os.path.abspath(executable))
@@ -97,7 +99,7 @@ def promote_notify_icon(executable: str) -> bool:
     except OSError:
         return False
 
-    promoted = False
+    demoted = False
     index = 0
     while True:
         try:
@@ -117,11 +119,11 @@ def promote_notify_icon(executable: str) -> bool:
             if os.path.normcase(os.path.abspath(str(path))) != exe:
                 continue
             try:
-                winreg.SetValueEx(sub, "IsPromoted", 0, winreg.REG_DWORD, 1)
-                promoted = True
+                winreg.SetValueEx(sub, "IsPromoted", 0, winreg.REG_DWORD, 0)
+                demoted = True
             except OSError:
                 continue
-    return promoted
+    return demoted
 
 
 class TrayIcon:
@@ -132,7 +134,6 @@ class TrayIcon:
         self._own_icon = False
         self._wndproc = None
         self._taskbar_created = 0
-        self._promote_tries = 8
 
     def install(self) -> bool:
         hinstance = w.kernel32.GetModuleHandleW(None)
@@ -165,7 +166,7 @@ class TrayIcon:
         self._taskbar_created = int(w.user32.RegisterWindowMessageW("TaskbarCreated"))
         if not self._add_icon(announce=True):
             return False
-        self.try_promote()
+        demote_notify_icon(sys.executable)
         return True
 
     def uninstall(self) -> None:
@@ -178,13 +179,6 @@ class TrayIcon:
             w.user32.DestroyIcon(self._hicon)
         self.hwnd = 0
         self._hicon = 0
-
-    def try_promote(self) -> None:
-        if self._promote_tries <= 0:
-            return
-        self._promote_tries -= 1
-        if promote_notify_icon(sys.executable):
-            self._promote_tries = 0
 
     def _add_icon(self, *, announce: bool) -> bool:
         flags = w.NIF_MESSAGE | w.NIF_ICON | w.NIF_TIP | w.NIF_GUID | w.NIF_SHOWTIP
@@ -217,7 +211,7 @@ class TrayIcon:
         return nid
 
     def _load_icon(self) -> int:
-        ico = Path(__file__).resolve().parent.parent / "assets" / "fun-tab.ico"
+        ico = asset_path("fun-tab.ico")
         handle = 0
         if ico.exists():
             handle = int(
@@ -255,8 +249,6 @@ class TrayIcon:
                 return 0
             if self._taskbar_created and msg == self._taskbar_created:
                 self._add_icon(announce=False)
-                self._promote_tries = 8
-                self.try_promote()
                 return 0
             return w.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 

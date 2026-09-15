@@ -63,7 +63,7 @@ def test_ask_quit_is_false_when_nothing_is_running(monkeypatch):
     assert tray.ask_running_instance_to_quit() is False
 
 
-def test_promote_matches_only_our_executable(tmp_path, monkeypatch):
+def test_demote_matches_only_our_executable(tmp_path, monkeypatch):
     import winreg
 
     calls = []
@@ -112,5 +112,5 @@ def test_promote_matches_only_our_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(winreg, "HKEY_CURRENT_USER", 0, raising=False)
     monkeypatch.setattr(winreg, "REG_DWORD", 4, raising=False)
 
-    assert tray.promote_notify_icon(str(ours)) is True
-    assert calls == [("IsPromoted", 1)]
+    assert tray.demote_notify_icon(str(ours)) is True
+    assert calls == [("IsPromoted", 0)]

@@ -130,7 +130,14 @@ BI_RGB = 0
 DIB_RGB_COLORS = 0
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TOKEN_QUERY = 0x0008
+TokenElevation = 20
 PW_RENDERFULLCONTENT = 2
+
+# GetWindowDisplayAffinity — apps can opt out of screen capture.
+WDA_NONE = 0x00000000
+WDA_MONITOR = 0x00000001
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 WNDPROC = ctypes.WINFUNCTYPE(
     ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
@@ -533,6 +540,11 @@ user32.FindWindowW.restype = wintypes.HWND
 user32.SwitchToThisWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
 user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
 user32.AllowSetForegroundWindow.restype = wintypes.BOOL
+user32.GetWindowDisplayAffinity.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(wintypes.DWORD),
+]
+user32.GetWindowDisplayAffinity.restype = wintypes.BOOL
 user32.keybd_event.argtypes = [
     wintypes.BYTE,
     wintypes.BYTE,
@@ -787,6 +799,73 @@ def process_image_path(pid: int) -> str:
         kernel32.CloseHandle(handle)
 
 
+class _TOKEN_ELEVATION(ctypes.Structure):
+    _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+advapi32.OpenProcessToken.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.HANDLE),
+]
+advapi32.OpenProcessToken.restype = wintypes.BOOL
+advapi32.GetTokenInformation.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+]
+advapi32.GetTokenInformation.restype = wintypes.BOOL
+
+
+def process_is_elevated(pid: int) -> bool:
+    """True when the target runs elevated relative to a normal user process.
+
+    Used to refuse close/minimise/capture against admin windows from a
+    non-elevated Fun Tab. Returns False when the answer cannot be read.
+    """
+    if not pid:
+        return False
+    process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not process:
+        return False
+    token = wintypes.HANDLE()
+    try:
+        if not advapi32.OpenProcessToken(process, TOKEN_QUERY, ctypes.byref(token)):
+            return False
+        elevation = _TOKEN_ELEVATION()
+        needed = wintypes.DWORD()
+        if not advapi32.GetTokenInformation(
+            token,
+            TokenElevation,
+            ctypes.byref(elevation),
+            ctypes.sizeof(elevation),
+            ctypes.byref(needed),
+        ):
+            return False
+        return bool(elevation.TokenIsElevated)
+    finally:
+        if token:
+            kernel32.CloseHandle(token)
+        kernel32.CloseHandle(process)
+
+
+def window_excludes_capture(hwnd: int) -> bool:
+    """True when the window asked Windows not to include it in captures."""
+    if not hwnd:
+        return False
+    affinity = wintypes.DWORD()
+    try:
+        if not user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(affinity)):
+            return False
+    except OSError:
+        return False
+    value = int(affinity.value)
+    return value in (WDA_MONITOR, WDA_EXCLUDEFROMCAPTURE)
+
+
 # ---------------------------------------------------------------------------
 # Windows accent colour, so the wheel can match the user's system theme.
 # ---------------------------------------------------------------------------
@@ -864,12 +943,17 @@ MF_UNCHECKED = 0x00000000
 TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD = 0x0100
 MB_OK = 0x00000000
+MB_OKCANCEL = 0x00000001
 MB_YESNO = 0x00000004
 MB_ICONINFORMATION = 0x00000040
 MB_ICONQUESTION = 0x00000020
+MB_ICONWARNING = 0x00000030
 MB_SETFOREGROUND = 0x00010000
 MB_TOPMOST = 0x00040000
+IDOK = 1
+IDCANCEL = 2
 IDYES = 6
+IDNO = 7
 
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL

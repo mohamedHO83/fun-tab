@@ -779,8 +779,18 @@ class Overlay:
         self._origin_live = False
         self._origin_shown = ()
         self._card_key = ()
+        self._query = ""
+        self._query_matched = True
+        self._thumbs.clear()
+        self._thumb_at.clear()
+        self._thumb_stamp.clear()
         with self._pending_lock:
             self._pending.clear()
+        with self._plate_lock:
+            self._plate = None
+            self._plate_rect = None
+            self._plate_at = 0.0
+        self._backdrop_plate = None
 
     def _preview_position(
         self, left: int, top: int, width: int, height: int
@@ -876,7 +886,11 @@ class Overlay:
 
         if text:
             needle = text.lower()
-            matches = [a for a in self._all_apps if needle in a.search_text]
+            matches = [
+                a
+                for a in self._all_apps
+                if a.matches_query(needle, title_privacy=self.cfg.title_privacy)
+            ]
         else:
             matches = list(self._all_apps)
 
@@ -1669,16 +1683,18 @@ class Overlay:
         app = self._apps[index]
         # Deliberately not keyed by position: the label says nothing about where
         # the slice sits, so re-ordering the wheel reuses every label.
+        title = app.label(title_privacy=self.cfg.title_privacy)
         key = (
             self._metrics_signature(),
-            app.display_name,
-            app.subtitle,
+            title,
+            app.subtitle if self.cfg.title_privacy == "full" else "",
             app.minimized,
             app.maximized,
             self._query,
             self._query_matched,
             self.compat_active,
             self.cfg.open_hotkey,
+            self.cfg.title_privacy,
         )
         cached = self._label_cache.get(key)
         if cached is not None:
@@ -1704,16 +1720,17 @@ class Overlay:
         hint_font = _font(BODY_FONTS, 11.5 * self.s)
 
         y = 14 * self.s * ss
-        title = _ellipsize(draw, app.display_name, title_font, max_width)
+        title = _ellipsize(draw, title, title_font, max_width)
         _centered(draw, title, centre + ss, y + ss, title_font, (0, 0, 0, 120))
         _centered(draw, title, centre, y, title_font, theme.text)
 
         y += 22 * self.s * ss
         if self.cfg.show_subtitle:
             parts = []
-            subtitle = app.subtitle
-            if subtitle:
-                parts.append(subtitle)
+            if self.cfg.title_privacy == "full":
+                subtitle = app.subtitle
+                if subtitle:
+                    parts.append(subtitle)
             if app.minimized:
                 parts.append("minimised")
             elif app.maximized:
@@ -1905,9 +1922,10 @@ class Overlay:
         key = (
             app.hwnd,
             self._thumb_stamp.get(app.hwnd, 0),
-            app.display_name,
+            app.label(title_privacy=self.cfg.title_privacy),
             self.preview_w,
             self.preview_h,
+            self.cfg.title_privacy,
         )
         if force or key != self._card_key:
             self._card_key = key
