@@ -132,10 +132,38 @@ class Config:
     minimized_last: bool = False
     # One slice per application; ` cycles that app's windows. Off = every window.
     group_by_app: bool = True
+    # A dot per window around a slice's rim, so group depth is visible before
+    # you select the slice rather than after.
+    group_pips: bool = True
     exclude_exes: list[str] = field(default_factory=list)
     exclude_titles: list[str] = field(default_factory=list)
-    # Executable names kept near the front of the wheel (after the current app).
+    # Executable names for the pinned lane, in slot order. Kept as the friendly
+    # way to write pins by hand; `slots` below is what the wheel actually reads.
     pinned_exes: list[str] = field(default_factory=list)
+
+    # --- pinned lane ------------------------------------------------------
+    # Apps attached to fixed angles at the bottom of the wheel, present whether
+    # or not they are running. Selecting a closed one launches it.
+    #
+    # Each slot is {"index", "exe", "aumid", "launch", "label"}; everything is
+    # optional except a way to recognise the app. Written by Ctrl+P, or by hand.
+    slots: list[dict] = field(default_factory=list)
+    pin_lane: bool = True
+    pin_slot_degrees: float = 30.0  # arc per slot; the lane is capped at 180 total
+    pin_gap_degrees: float = 6.0  # empty arc separating the lane from the MRU slices
+
+    # --- sub-ring ---------------------------------------------------------
+    # Overshoot the ring and the aimed app's windows fan out further out, so
+    # radial distance picks a window and angle picks the app.
+    subring: bool = True
+    # Different enter and exit radii: one threshold chatters when the cursor
+    # sits near it, which is the same class of problem as the pointer only
+    # having control while it is actually moving.
+    subring_enter: float = 1.30  # multiples of outer_radius
+    subring_exit: float = 1.12
+    subring_min_degrees: float = 12.0  # floor on a fan entry's sweep
+    # Offer "new window" as the last fan entry.
+    subring_new_window: bool = True
 
     # One toggle that forces the privacy preset (see privacy.apply_privacy_bundle).
     privacy_mode: bool = False
@@ -185,6 +213,15 @@ class Config:
                 setattr(cfg, key, _coerce(spec.type, value))
             except (TypeError, ValueError):
                 continue
+        if "slots" not in raw and cfg.pinned_exes:
+            # Upgrading: pins used to be a bare list of executables that merely
+            # reordered the wheel. They become real lane slots, in the order the
+            # user already wrote them.
+            #
+            # Keyed on the file rather than on "slots is empty", because those
+            # are only the same thing before the user has ever unpinned their
+            # last app — after which the check would silently pin it again.
+            cfg.set_slot_order(cfg.pinned_exes)
         cfg.clamp()
         return cfg
 
@@ -250,10 +287,48 @@ class Config:
         self.open_hotkey = parse_hotkey(self.open_hotkey).text()
         if self.privacy_mode:
             apply_privacy_bundle(self)
+        self.pin_slot_degrees = _clampf(self.pin_slot_degrees, 8.0, 90.0)
+        self.pin_gap_degrees = _clampf(self.pin_gap_degrees, 0.0, 30.0)
+        self.subring_enter = _clampf(self.subring_enter, 1.05, 3.0)
+        # Enter must sit outside exit or the transition has no memory left.
+        self.subring_exit = _clampf(self.subring_exit, 1.0, self.subring_enter - 0.05)
+        self.subring_min_degrees = _clampf(self.subring_min_degrees, 4.0, 60.0)
         self.exclude_exes = _normalize_exe_names(self.exclude_exes)
         self.pinned_exes = _normalize_exe_names(self.pinned_exes)
         blocked = set(self.exclude_exes)
         self.pinned_exes = [name for name in self.pinned_exes if name not in blocked]
+        self.slots = _normalize_slots(self.slots, blocked)
+        # The lane is the wheel's view of the pins, so the friendly list has to
+        # agree with it after any hand-edit of either one.
+        self.pinned_exes = [
+            str(slot.get("exe") or "") for slot in self.slots if slot.get("exe")
+        ]
+
+    def lane_slots(self) -> list[dict]:
+        """The slots the wheel should reserve arc for right now."""
+        return list(self.slots) if self.pin_lane else []
+
+    def set_slot_order(self, names: list[str]) -> None:
+        """Rewrite the lane from a plain list of executables, in slot order.
+
+        The settings window edits pins as a reorderable list of names, which is
+        the right control for "which apps, in what order" but cannot express the
+        AUMID and launch target a slot also carries. So the names decide
+        membership and order, and everything already known about each app is
+        carried across rather than being thrown away and re-guessed.
+        """
+        known = {
+            (slot.get("exe") or "").lower(): slot for slot in self.slots if slot.get("exe")
+        }
+        wanted = _normalize_exe_names(names)
+        rebuilt = [dict(known[name]) for name in wanted if name in known]
+        rebuilt += [{"exe": name} for name in wanted if name not in known]
+        # Slots identified only by AUMID cannot appear in a list of executables,
+        # so they would silently vanish on every save. Keep them.
+        rebuilt += [dict(slot) for slot in self.slots if not slot.get("exe")]
+        for index, slot in enumerate(rebuilt):
+            slot["index"] = index
+        self.slots = rebuilt
 
 
 def _coerce(annotation: Any, value: Any) -> Any:
@@ -266,6 +341,9 @@ def _coerce(annotation: Any, value: Any) -> Any:
         return float(value)
     if text.startswith("str"):
         return str(value)
+    if text.startswith("list[dict"):
+        # Ahead of the plain-list branch below, which would stringify each slot.
+        return [dict(v) for v in value if isinstance(v, dict)]
     if text.startswith("list"):
         return [str(v) for v in value]
     if text.startswith("dict"):
@@ -275,6 +353,64 @@ def _coerce(annotation: Any, value: Any) -> Any:
 
 def _clampf(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
+
+
+MAX_SLOTS = 8
+
+
+def _normalize_slots(slots: list[dict] | None, blocked: set[str]) -> list[dict]:
+    """Validated lane slots, in slot order.
+
+    A hand-edited file has to degrade to "no pins" rather than to a broken
+    wheel, so anything unrecognisable is dropped instead of raising: a slot with
+    no way to identify its app cannot be matched or launched, and two slots
+    claiming one app would give it two slices.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(exe: str = "", aumid: str = "", launch: str = "", label: str = "") -> None:
+        exe = os.path.basename(str(exe).strip().strip('"')).lower()
+        if exe and not exe.endswith(".exe"):
+            exe += ".exe"
+        aumid = str(aumid).strip()
+        if not exe and not aumid:
+            return  # nothing to match a window against, and nothing to launch
+        if exe and exe in blocked:
+            return  # hidden apps must not reappear through the lane
+        key = aumid.lower() or exe
+        if key in seen or len(out) >= MAX_SLOTS:
+            return
+        seen.add(key)
+        slot = {"index": len(out)}
+        if exe:
+            slot["exe"] = exe
+        if aumid:
+            slot["aumid"] = aumid
+        if launch:
+            slot["launch"] = str(launch).strip()
+        if label:
+            slot["label"] = str(label).strip()[:64]
+        out.append(slot)
+
+    ordered = sorted(
+        (s for s in (slots or ()) if isinstance(s, dict)), key=_slot_order
+    )
+    for slot in ordered:
+        add(
+            exe=slot.get("exe") or "",
+            aumid=slot.get("aumid") or "",
+            launch=slot.get("launch") or "",
+            label=slot.get("label") or "",
+        )
+    return out
+
+
+def _slot_order(slot: dict) -> float:
+    try:
+        return float(slot.get("index", 0))
+    except (TypeError, ValueError):
+        return float(MAX_SLOTS)  # unreadable index sorts last rather than exploding
 
 
 def _normalize_exe_names(names: list[str] | tuple[str, ...] | None) -> list[str]:

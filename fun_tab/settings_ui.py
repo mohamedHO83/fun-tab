@@ -161,6 +161,28 @@ SETTINGS: tuple[Setting, ...] = (
         "Windows",
         hint="Many windows of the same app become one slice. Press ` to cycle them.",
     ),
+    Setting(
+        "group_pips",
+        "Show a dot per window on each slice",
+        "check",
+        "Windows",
+        hint="Tells you which slices hold several windows before you pick one.",
+    ),
+    Setting(
+        "subring",
+        "Reach past the ring to pick a single window",
+        "check",
+        "Aiming",
+        hint="Overshoot a slice and its windows fan out further out. Pull back for apps again.",
+    ),
+    Setting(
+        "pin_lane",
+        "Give pinned apps fixed places on the wheel",
+        "check",
+        "Windows",
+        hint="Pinned apps sit at the bottom at the same angle every time, open or not."
+        " Selecting a closed one starts it.",
+    ),
     Setting("minimized_last", "Push minimised windows to the end", "check", "Windows"),
     Setting(
         "close_key_enabled", "Let Delete and Ctrl+W close a window", "check", "Windows"
@@ -423,8 +445,9 @@ class SettingsWindow:
                 frame,
                 row,
                 attr="_pinned_exes",
-                title="Pinned apps",
-                hint="These stay near the front of the wheel, just after the app you came from.",
+                title="Pinned apps (in slot order)",
+                hint="Each one gets a fixed place at the bottom of the wheel, whether or not"
+                " it is running. Selecting a closed one starts it.",
             )
         if group == "Privacy":
             row = self._build_exe_list(
@@ -629,7 +652,7 @@ class SettingsWindow:
             )
         cfg = config_with(self.cfg, values)
         cfg.exclude_exes = list(self._exclude_exes)
-        cfg.pinned_exes = list(self._pinned_exes)
+        cfg.set_slot_order(self._pinned_exes)
         cfg.clamp()
         return cfg
 

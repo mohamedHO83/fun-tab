@@ -18,7 +18,7 @@ build.bat
 
 That writes `dist\FunTab.zip`, and `dist\FunTabSetup.exe` if [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed. They can run the setup (Start Menu + optional desktop shortcut, no `_internal` folder to keep) or unzip the zip and double-click **FunTab.exe**. Keep `_internal` next to the exe if you use the zip — it is not optional. The first start can trip SmartScreen because the exe is unsigned; *More info* → *Run anyway*.
 
-A tagged GitHub release (`v0.3.0` and so on) builds both files automatically.
+A tagged GitHub release (`v0.4.0` and so on) builds both files automatically.
 
 A tray icon appears (look behind the **^** arrow on the taskbar if Windows hid it). Click it for **Settings**, or quit from there when you're done. Running Fun Tab again also asks whether to quit, which is the way out if the icon is missing. `install_desktop_shortcut.bat` puts a shortcut on the desktop (the packed exe if you have built it, otherwise the source launcher).
 
@@ -41,9 +41,10 @@ Everything below works while Alt is held. Release Alt to switch.
 | **Alt+Tab** | Opens the wheel when that is the open shortcut |
 | **Alt+Shift+Tab** | Open going backwards (when the open shortcut is Alt+Tab) |
 | **Ctrl+Alt+Tab** | Sticky open; also the fallback while game compatibility owns Alt+Tab |
-| **Alt+`** | Open showing only the current app's windows |
+| **Alt+`** | Open with the current app's windows already fanned out |
 | **Flick the mouse** | Aim by direction from wherever the cursor already is - no need to drag it to the wheel first |
 | **Point at a slice** | With the cursor actually on the ring, it picks whatever it's over |
+| **Reach past the ring** | Fans out that app's windows on an outer band - angle picks the app, distance picks the window. Pull back for apps again |
 | **Needle in the hub** | Shows the direction you're aiming, whenever the mouse has control |
 | **Ring on the desktop** | Marks the spot your aim is measured from |
 | **Tab / Shift+Tab** | Next / previous |
@@ -53,16 +54,46 @@ Everything below works while Alt is held. Release Alt to switch.
 | **Type any letters** | Filter the wheel by window title, app name or executable |
 | **Backspace** | Edit the filter |
 | **Home / End** | First / last window |
-| **`** | Cycle between windows of the selected app (also expands a grouped slice) |
+| **`** | Step through the windows of the selected app, in the outer band |
 | **Enter**, **Space**, **left click** | Switch to the selection (a click anywhere counts) |
+| **Enter on a pinned app that isn't running** | Starts it |
 | **Right click a slice** | Hide this app, pin, close, or minimise |
 | **Delete**, **Ctrl+W**, **Ctrl+Q** | Close the selected window, keep the wheel open |
 | **Ctrl+M** | Minimise the selected window |
 | **Ctrl+H** | Hide this app from the wheel (saved in Settings) |
-| **Ctrl+P** | Pin / unpin this app near the front of the wheel |
+| **Ctrl+P** | Pin / unpin this app - gives it a fixed place on the wheel |
 | **Esc** | Clear the filter, or cancel if there is no filter |
 
-Windows are ordered most-recently-used first, so Alt+Tab always lands on the app you came from and Alt+Tab+Tab lands on the one before it. With **one slice per application** (on by default) that second step is the previous *app*, not another window of the same one. Press `` ` `` to rotate through that app's windows; typing a filter expands matches so you can pick a specific title.
+Windows are ordered most-recently-used first, so Alt+Tab always lands on the app you came from and Alt+Tab+Tab lands on the one before it. With **one slice per application** (on by default) that second step is the previous *app*, not another window of the same one. Press `` ` `` to step through that app's windows; typing a filter expands matches so you can pick a specific title.
+
+Slices are grouped by the same identity the taskbar uses (AppUserModelID), not by executable, so two Chrome profiles are two slices exactly as they are two taskbar buttons. Apps that declare no identity of their own - most plain Win32 ones - fall back to the executable.
+
+### Distance picks the window, angle picks the app
+
+A grouped slice used to be a dead end: it said "Chrome, 3 windows" and the only way in was the keyboard. Reach *past* the ring and that app's windows fan out on an outer band, so one continuous movement chooses both - flick to aim at the app, push a little further to choose which of its windows, pull back to change your mind. A dot per window on each slice's rim tells you which slices have anything out there before you go looking.
+
+Radial distance was the one input the wheel was measuring and throwing away; `aim` used it only to ignore the hub. Spending it on depth costs nothing you were using.
+
+Two details do most of the work. The band **latches** which app it belongs to when you enter it, because once you are out there the angle is choosing a window, and letting it keep choosing the app as well would change both at once. And entering and leaving use **different radii** (1.30 and 1.12 of the ring), because a single threshold makes the whole band flicker open and shut while the cursor rests near it.
+
+The fan deliberately **overhangs its slice**. Confining it to the slice's own span sounds tidier, but a three-window app on a crowded wheel would get under six degrees per entry - legible and unusable at the same time.
+
+The one real cost is the canvas: drawing outside the ring means a surface about 60% larger, which takes a selection change from 0.7 ms to 1.3 ms. Held frames are unaffected, because those only re-present the bitmap. Setting `subring` to `false` gives back the exact old canvas size.
+
+### Pinned apps have a fixed direction
+
+Pinning used to mean "sorted nearer the front", which only helped if the app was already running and still moved as the list moved. A pinned app now gets a **fixed slot at the bottom of the wheel**, at the same angle every time, whether or not it is open - and selecting one that isn't open starts it. That makes the direction learnable, which is the whole point: Spotify is down-left, always, and getting to it is a flick rather than a search.
+
+Pinned slots aren't built from the window list at all. They're a second source read from your config and merged in at layout time, which is exactly why a closed app still renders: nothing ever asked Windows whether it exists. A closed slot shows a desaturated icon and a dashed rim, so "will launch" and "will switch" are tellable apart without reading anything - mistaking one for the other trades a 14 ms switch for an unexpected cold start.
+
+The lane sits at 6 o'clock and the open windows share whatever arc is left, separated by an empty gap. Some alternatives that didn't survive:
+
+- **A second ring further out** for pins - but that is where the window fan now lives, and two meanings for "further out" is one too many.
+- **A lane between the hub and the ring** - too little arc length at that radius to flick at, and it boxes in the hub.
+- **A drawn divider** instead of a gap - a line reads as decoration, a gap reads as two regions.
+- **A fixed number of slots**, so angles never move at all - but a permanently reserved half-wheel is a bad trade for users with no pins, and the lane is capped at half the wheel anyway so that closed apps never get wider targets than the windows you're actually using.
+
+Straight up stays slice 0 for every window count. With the lane symmetric about 6 o'clock the free arc is symmetric about 12 o'clock, which makes 12 o'clock a slice *centre* for odd counts and a *seam* for even ones; for even counts the free arc is divided into one more slot than there are windows and the spare is left empty. The gap lands beside slice 0, where it reads as the boundary between the newest and oldest window.
 
 ### Mouse and keyboard don't fight
 
@@ -143,13 +174,22 @@ Everything still lives in `%APPDATA%\fun-tab\config.json`, written with defaults
 | `title_privacy` | `"full"` | `full` shows window titles; `app` shows application names only |
 | `privacy_mode` | `false` | Forces the privacy preset (no previews/prefetch/minimised capture/close keys; app labels) |
 | `mru_order` | `true` | Most-recently-used ordering |
-| `group_by_app` | `true` | One slice per application; `` ` `` cycles that app's windows |
+| `group_by_app` | `true` | One slice per application (by AppUserModelID, falling back to executable); `` ` `` steps through that app's windows |
+| `group_pips` | `true` | A dot per window on each slice's rim |
+| `subring` | `true` | Reach past the ring to fan out the aimed app's windows |
+| `subring_enter`, `subring_exit` | `1.30`, `1.12` | Multiples of `outer_radius` at which the fan opens and closes. Different on purpose: one threshold chatters |
+| `subring_min_degrees` | `12` | Floor on a fan entry's width, so a crowded wheel still gives flickable targets |
+| `subring_new_window` | `true` | Offer "new window" as the last fan entry of a pinned app |
 | `search_enabled`, `digit_jump`, `close_key_enabled` | `true` | Turn off the typing, number and close bindings |
 | `close_confirm` | `true` | Ask before the first Delete/Ctrl+W close each session |
 | `wrap_navigation` | `true` | Cycling past the end wraps around |
 | `minimized_last` | `false` | Push minimised windows to the end of the wheel |
 | `exclude_exes` | `[]` | e.g. `["teams.exe"]` - never show these (password managers are always excluded). Also edited as **Hidden apps** in Settings. |
-| `pinned_exes` | `[]` | e.g. `["spotify.exe"]` - keep these just after the current app |
+| `pinned_exes` | `[]` | e.g. `["spotify.exe"]` - the pinned apps in slot order. The friendly way to write pins, and what **Pinned apps** edits in Settings; kept in step with `slots` |
+| `slots` | `[]` | What the lane actually reads. One entry per pin: `{"index": 0, "exe": "spotify.exe", "aumid": "...", "launch": "...", "label": "Spotify"}`. Only a way to recognise the app is required; `launch` is recorded when you pin and is what gets started when the app is closed. Max 8 |
+| `pin_lane` | `true` | Give pinned apps fixed slots at the bottom of the wheel |
+| `pin_slot_degrees` | `30` | Arc per pinned slot. The lane as a whole is capped at 180° |
+| `pin_gap_degrees` | `6` | Empty arc separating the lane from the open windows |
 | `exclude_titles` | `[]` | Substring match on window titles |
 | `open_hotkey` | `"alt+tab"` | Open chord: `alt+tab`, `ctrl+alt+tab`, `mouse4`, `ctrl+mouse5`, … |
 | `open_sticky` | `false` | Keep the wheel open after releasing the open shortcut |

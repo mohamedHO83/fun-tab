@@ -158,16 +158,24 @@ def test_grouping_collapses_chrome_into_one_slice():
     assert chrome.peer_hwnds == (2, 3)
 
 
-def test_grouped_backtick_rotates_the_face_without_adding_slices():
+def test_grouped_backtick_steps_the_fan_and_leaves_the_slice_alone():
+    """`` ` `` moves within the app's windows without disturbing the wheel.
+
+    It used to rotate which peer was the group's face, which meant a grouped
+    slice changed its label underneath the user on every cycle. The fan owns
+    window choice now, so slice identity stays put and stays learnable.
+    """
     o = wheel(group_by_app=True)
     o._apps = o._present_apps()
     o._selected = 1
     assert o.selected_app().title == "Inbox"
     o.cycle_same_app(1)
     assert o.selected_app().title == "Gmail"
-    assert [a.title for a in o.apps] == ["notes.md", "Gmail", "standup", "Now Playing"]
+    assert o.expanded == 1, "stepped outward into Chrome's fan"
+    assert [a.title for a in o.apps] == ["notes.md", "Inbox", "standup", "Now Playing"]
     o.cycle_same_app(1)
-    assert o.selected_app().title == "Inbox"
+    assert o.selected_app().title == "Inbox", "wraps within the fan"
+    assert o.selected_index == 1, "and never leaves the slice"
 
 
 def test_search_ungroups_so_a_title_can_be_picked():

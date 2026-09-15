@@ -21,7 +21,7 @@ import math
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 import numpy as np
@@ -31,7 +31,7 @@ from . import win32_types as w
 from .config import Config, Theme, alpha
 from .config import mix as _mix
 from .gdi import LayeredSurface, ScreenGrabber
-from .wheel import WheelLayout, build_layout, pie_points
+from .wheel import RingLayout, WheelLayout, build_fan, build_wheel, pie_points
 from .windows_enum import AppWindow, capture_thumbnail, group_key, present_windows
 
 RENDER_SCALE = 2
@@ -39,6 +39,12 @@ PREVIEW_FADE = 0.13
 # Aim angles are snapped to this, so a jittering pointer cannot cost a repaint
 # per frame while still tracking smoothly by eye.
 AIM_STEP = math.radians(1.5)
+
+# Where the fan sits, in multiples of the ring's outer radius. It has to clear
+# the ring's edge by enough that the two never read as one band, and it sets how
+# much extra canvas the overlay needs.
+FAN_INNER = 1.07
+FAN_OUTER = 1.34
 
 TITLE_FONTS = (
     r"C:\Windows\Fonts\seguisb.ttf",
@@ -180,11 +186,17 @@ class Layer:
 @dataclass
 class WheelLayers:
     base: Image.Image
-    layout: WheelLayout
+    layout: RingLayout
+    # Rim marks for every slice at once: they say nothing about the selection,
+    # so one layer serves every frame.
+    marks: Optional[Image.Image] = None
     hl: dict[int, Layer] = field(default_factory=dict)
     hub: dict[int, Layer] = field(default_factory=dict)
     label: dict[int, Layer] = field(default_factory=dict)
     frames: dict[int, Image.Image] = field(default_factory=dict)
+    # Keyed by the expanded slice, not by the selection inside it: the fan's
+    # pixels only change when a different app is expanded, which is far rarer.
+    fan: dict[int, Layer] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -307,11 +319,24 @@ class Overlay:
 
         self._visible = False
         self._sticky = False
+        # `_apps` is a flat list: MRU slices first, then the pinned lane. Every
+        # index-based path — Tab, the digit jumps, the label and hub caches —
+        # therefore needs no idea the lane exists.
         self._apps: list[AppWindow] = []
         self._all_apps: list[AppWindow] = []
+        self._lane_count = 0
         self._selected = 0
         self._query = ""
         self._query_matched = True
+
+        # Sub-ring. `_expanded` is latched on entry rather than recomputed per
+        # frame: inside the fan the angle is choosing a window, so letting it
+        # keep choosing the app as well would change both at once.
+        self._expanded: Optional[int] = None
+        self._fan_apps: list[AppWindow] = []
+        self._fan_layout: Optional[WheelLayout] = None
+        self._fan_selected = 0
+        self._launching: Optional[AppWindow] = None
 
         self._monitor = (0, 0, 1920, 1080)
         self._dpi = 96
@@ -322,7 +347,6 @@ class Overlay:
         self._on_cancel: Optional[Callable[[], None]] = None
         self._on_context: Optional[Callable[[], None]] = None
         self.compat_active = False
-        self._expand_app = False
 
         self._layers: Optional[WheelLayers] = None
         self._layer_cache: OrderedDict[tuple, WheelLayers] = OrderedDict()
@@ -332,13 +356,16 @@ class Overlay:
         self._wedge_cache: dict[tuple, Layer] = {}
         self._hub_cache: dict[tuple, Layer] = {}
         self._label_cache: dict[tuple, Layer] = {}
+        self._pip_cache: dict[tuple, Image.Image] = {}
+        self._fan_cache: dict[tuple, Layer] = {}
+        self._fan_frames: dict[tuple, Image.Image] = {}
 
         self._shown_at = 0.0
         self._last_frame = 0.0
         self._sel_from = -1
         self._sel_t0 = 0.0
         self._dirty = True
-        self._written_index = -2
+        self._written_frame = None
 
         self._thumbs: dict[int, Image.Image] = {}
         self._thumb_stamp: dict[int, int] = {}
@@ -396,6 +423,20 @@ class Overlay:
         return self._query
 
     def selected_app(self) -> Optional[AppWindow]:
+        """What committing right now would act on.
+
+        Inside the fan that is a specific window (or "new window"), which is the
+        whole point of the extra radial step.
+        """
+        if self._expanded is not None and self._fan_apps:
+            index = min(self._fan_selected, len(self._fan_apps) - 1)
+            return self._fan_apps[index]
+        if self._apps and 0 <= self._selected < len(self._apps):
+            return self._apps[self._selected]
+        return None
+
+    def selected_slice(self) -> Optional[AppWindow]:
+        """The slice being aimed at, ignoring any fan open on top of it."""
         if self._apps and 0 <= self._selected < len(self._apps):
             return self._apps[self._selected]
         return None
@@ -479,6 +520,9 @@ class Overlay:
         self._wedge_cache.clear()
         self._hub_cache.clear()
         self._label_cache.clear()
+        self._pip_cache.clear()
+        self._fan_cache.clear()
+        self._fan_frames.clear()
         self._card_cache.clear()
         self._chrome_cache.clear()
         self._placeholder_cache.clear()
@@ -503,11 +547,15 @@ class Overlay:
         if self._visible or not apps:
             return
         self._update_monitor()
-        saved_apps, saved_selected = self._apps, self._selected
-        self._apps = list(apps)
+        saved = (self._apps, self._selected, self._lane_count, self._all_apps)
+        self._all_apps = list(apps)
         self._selected = 0
         try:
-            self._ring_plate(len(apps))
+            # Presented rather than raw, so the warmed caches are keyed the way
+            # the first open will actually ask for them — grouped, with the lane
+            # already split out.
+            self._apps = self._present_apps()
+            self._ring_plate(*self._counts())
             idle_px = self._icon_size(1)
             active_px = self._highlight_icon_px(1)
             for app in self._apps:
@@ -520,7 +568,7 @@ class Overlay:
         except Exception:
             pass
         finally:
-            self._apps, self._selected = saved_apps, saved_selected
+            self._apps, self._selected, self._lane_count, self._all_apps = saved
 
     def _register(self, hinstance, class_name: str, wndproc) -> None:
         wc = w.WNDCLASSEXW()
@@ -624,10 +672,18 @@ class Overlay:
         return wndproc
 
     def _point_on_wheel(self, x: float, y: float) -> bool:
+        """Whether the pointer is close enough to be taken literally.
+
+        With the sub-ring on this has to cover the fan's band too. Otherwise the
+        literal region stops short of the radius that opens the fan, and the only
+        way to reach depth is a flick long enough to measure from the anchor —
+        which is to say, not by pointing at the thing.
+        """
         if not self._layers:
             return False
         layout = self._layers.layout
-        return math.hypot(x - layout.cx, y - layout.cy) <= layout.outer_r * 1.06
+        reach = max(1.06, self.cfg.subring_enter + 0.12) if self.cfg.subring else 1.06
+        return math.hypot(x - layout.cx, y - layout.cy) <= layout.outer_r * reach
 
     # -- metrics -----------------------------------------------------------
 
@@ -639,16 +695,21 @@ class Overlay:
 
         self.outer_r = max(60, int(round(cfg.outer_radius * scale)))
         self.inner_r = max(20, int(round(min(cfg.inner_radius, cfg.outer_radius - 24) * scale)))
-        self.margin = int(round(30 * scale))
+        # The fan is drawn outside the ring, so the canvas has to leave room for
+        # it on all four sides — the lane sits at the bottom, so its fan lands
+        # exactly where the label used to start.
+        self.fan_r = int(round(self.outer_r * (FAN_OUTER if cfg.subring else 1.0)))
+        fan_pad = max(0, self.fan_r - self.outer_r)
+        self.margin = int(round(30 * scale)) + fan_pad
         self.label_h = int(round((96 if cfg.show_hints else 92) * scale))
         self._mouse_slop = max(3, int(round(7 * scale)))
         self._origin_size = max(12, int(round(26 * scale)) // 2 * 2)  # even, so it centres
 
         self.canvas_w = self.outer_r * 2 + self.margin * 2
-        self.canvas_h = self.margin + self.outer_r * 2 + self.label_h
+        self.canvas_h = self.margin + self.outer_r * 2 + fan_pad + self.label_h
         self.wheel_cx = self.canvas_w // 2
         self.wheel_cy = self.margin + self.outer_r
-        self.label_top = self.wheel_cy + self.outer_r + int(round(16 * scale))
+        self.label_top = self.wheel_cy + self.fan_r + int(round(16 * scale))
 
         self.f_title = _font(TITLE_FONTS, 21 * scale)
         self.f_sub = _font(BODY_FONTS, 12.5 * scale)
@@ -674,7 +735,15 @@ class Overlay:
             self.cfg.show_hints,
             self.cfg.show_subtitle,
             self.cfg.show_counter,
+            self.cfg.group_pips,
+            self.cfg.pin_slot_degrees,
+            self.cfg.pin_gap_degrees,
         )
+
+    def _counts(self) -> tuple[int, int]:
+        """(MRU slices, lane slots) — everything geometric derives from this."""
+        lane = min(self._lane_count, len(self._apps))
+        return (len(self._apps) - lane, lane)
 
     def _update_monitor(self) -> None:
         point = w.POINT()
@@ -705,13 +774,12 @@ class Overlay:
         selected: int = 0,
         sticky: bool = False,
         *,
-        expand_app: bool = False,
+        expand_fan: bool = False,
     ) -> None:
         if not apps:
             return
         self._update_monitor()
 
-        self._expand_app = expand_app
         self._all_apps = list(apps)
         self._apps = self._present_apps()
         if not self._apps:
@@ -720,11 +788,15 @@ class Overlay:
         self._sticky = sticky
         self._query = ""
         self._query_matched = True
+        self._collapse_fan()
+        # Opening again answers the launching card's question, and with previews
+        # off nothing else would ever take that surface back.
+        self.hide_launching()
         self._sel_from = -1
         self._shown_at = time.perf_counter()
         self._sel_t0 = self._shown_at
         self._dirty = True
-        self._written_index = -2
+        self._written_frame = None
         self._written_aim = None
         self._aim_angle = None
 
@@ -741,6 +813,11 @@ class Overlay:
         show_backdrop = self._present_backdrop(left, top, width, height)
 
         self._rebuild_layers()
+        if expand_fan:
+            # Alt+` used to flatten every window onto the ring, which meant a
+            # second mental model for the same question. Now it just opens one
+            # step further out, already in the fan.
+            self._enter_fan(self._selected, select=1)
         self._render(self._shown_at, force=True)
 
         self._visible = True
@@ -795,6 +872,9 @@ class Overlay:
             w.user32.SetWindowPos(hwnd, w.HWND_TOPMOST, 0, 0, 0, 0, flags)
         self._apps = []
         self._all_apps = []
+        self._lane_count = 0
+        self._collapse_fan()
+        self._launching = None
         self._layers = None
         self._mouse_anchor = None
         self._last_cursor = None
@@ -815,6 +895,89 @@ class Overlay:
             self._plate_rect = None
             self._plate_at = 0.0
         self._backdrop_plate = None
+
+    # -- launch feedback ---------------------------------------------------
+    #
+    # Everything else Fun Tab does finishes inside a frame. Launching does not,
+    # and a wheel that vanishes with nothing visibly happening for two seconds
+    # reads as a failure rather than as a cold start. So the preview window —
+    # already its own layered surface, already positioned — stays behind to say
+    # so, and is dismissed by the real foreground event rather than a timer.
+
+    def show_launching(self, app: AppWindow) -> None:
+        if not self.cfg.preview_enabled or not self._preview_hwnd:
+            return
+        self._launching = app
+        card = self._launch_card(app)
+        if not self._preview.ensure(*card.size):
+            return
+        self._preview.write(card)
+        x, y = self._preview_origin
+        self._preview.present(x, y, 1.0)
+        w.user32.SetWindowPos(
+            self._preview_hwnd,
+            w.HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            w.SWP_SHOWWINDOW | w.SWP_NOACTIVATE | w.SWP_NOMOVE | w.SWP_NOSIZE,
+        )
+
+    def hide_launching(self) -> None:
+        if self._launching is None:
+            return
+        self._launching = None
+        self._card_key = ()
+        w.user32.SetWindowPos(
+            self._preview_hwnd,
+            w.HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            w.SWP_HIDEWINDOW | w.SWP_NOACTIVATE | w.SWP_NOMOVE | w.SWP_NOSIZE,
+        )
+
+    @property
+    def launching(self) -> Optional[AppWindow]:
+        return self._launching
+
+    def _launch_card(self, app: AppWindow) -> Image.Image:
+        name = (app.app_name or app.exe_name or "the app").strip()
+        return self._status_card(app, f"Starting {name}…", "this one was not running")
+
+    def _status_card(self, app: AppWindow, headline: str, note: str) -> Image.Image:
+        """A preview card for an app with no window to photograph.
+
+        The normal card would sit on "loading preview…" forever, which reads as
+        a broken capture rather than as an app that simply is not running.
+        """
+        key = ("status", headline, note, app.app_name, self.preview_w, self.preview_h, self._theme_rev)
+        cached = self._card_cache.get(key)
+        if cached is not None:
+            return cached
+
+        theme = self.theme
+        pw, ph, pad = self.preview_w, self.preview_h, self.preview_pad
+        frame, mask = self._card_chrome()
+        img = frame.copy()
+
+        inner = Image.new("RGBA", (pw, ph), alpha(theme.card_fill, 255))
+        draw = ImageDraw.Draw(inner, "RGBA")
+        icon_px = int(76 * self.s)
+        icon = self._icon_at(app, icon_px)
+        if icon is not None:
+            inner.alpha_composite(
+                icon, ((pw - icon_px) // 2, (ph - icon_px) // 2 - int(14 * self.s))
+            )
+        _centered(draw, headline, pw / 2, ph - int(38 * self.s), self.f_sub, theme.text)
+        _centered(draw, note, pw / 2, ph - int(20 * self.s), self.f_hint, theme.text_dim)
+        img.paste(inner, (pad, pad), mask)
+
+        self._card_cache[key] = img
+        _trim(self._card_cache, 12)
+        return img
 
     def _preview_position(
         self, left: int, top: int, width: int, height: int
@@ -845,6 +1008,9 @@ class Overlay:
             # Every discrete pick — Tab, digits, search, the scroll wheel —
             # takes the wheel back off the pointer.
             self._release_mouse()
+        # Aiming somewhere else is a statement about which app, so any fan open
+        # on the old slice is answering a question that is no longer being asked.
+        self._collapse_fan()
         self._sel_from = self._selected if animate else -1
         self._sel_t0 = time.perf_counter()
         self._selected = index
@@ -875,19 +1041,149 @@ class Overlay:
     def last(self) -> None:
         self.select(len(self._apps) - 1)
 
+    # -- sub-ring ----------------------------------------------------------
+    #
+    # Aim a short way from the hub and you are picking an application, exactly
+    # as before. Overshoot the ring and that application's windows fan out
+    # further out, so the same flick keeps meaning "that app" and the distance
+    # says which of its windows. Apps with nothing to fan never expand, so
+    # overshooting one is never punished.
+
+    @property
+    def expanded(self) -> Optional[int]:
+        return self._expanded
+
+    @property
+    def fan_apps(self) -> list[AppWindow]:
+        return list(self._fan_apps)
+
+    @property
+    def fan_selected(self) -> int:
+        return self._fan_selected
+
+    def _fan_entries(self, index: int) -> list[AppWindow]:
+        """What a slice's fan would contain, or [] if it has no depth.
+
+        A closed pinned slot is the degenerate case: one entry, "new window".
+        Launching is then not a separate code path, just a fan of length one.
+        """
+        if not (0 <= index < len(self._apps)):
+            return []
+        app = self._apps[index]
+        if app.is_dead:
+            return [replace(app, title="New window")]
+
+        peers = [a for a in self._all_apps if a.hwnd in app.peer_hwnds]
+        peers.sort(key=lambda a: a.z_index)
+        if len(peers) < 2 and not (app.is_pinned and self.cfg.subring_new_window):
+            return []
+        entries = peers or [app]
+        if app.is_pinned and self.cfg.subring_new_window:
+            # Only offered for pinned slots: those are the ones with a recorded
+            # launch target, and spawning a window is what their slot is for.
+            entries = entries + [replace(app, hwnd=0, title="New window", running=False)]
+        return entries
+
+    def _enter_fan(self, index: int, *, select: Optional[int] = None) -> bool:
+        entries = self._fan_entries(index)
+        if not entries:
+            return False
+        if self._expanded == index:
+            return True
+        self._expanded = index
+        self._fan_apps = entries
+        self._fan_layout = None
+        self._fan_dirty(index)
+        # Opens on the window that is already the slice's face, so the fan
+        # appears showing where you are rather than having moved you somewhere.
+        if select is None:
+            select = next(
+                (i for i, a in enumerate(entries) if a.hwnd == self._apps[index].hwnd), 0
+            )
+        self._fan_selected = min(max(select, 0), len(entries) - 1)
+        return True
+
+    def _collapse_fan(self) -> None:
+        if self._expanded is None and not self._fan_apps:
+            return
+        was = self._expanded
+        self._expanded = None
+        self._fan_apps = []
+        self._fan_layout = None
+        self._fan_selected = 0
+        self._fan_dirty(was)
+
+    def _fan_dirty(self, index: Optional[int]) -> None:
+        """Invalidate what the fan feeds into.
+
+        The label band names the window the fan is pointing at, and that band is
+        baked into the per-slice frame, so a fan step has to drop both rather
+        than only the composited copy.
+        """
+        self._fan_frames.clear()
+        layers = self._layers
+        if layers is not None and index is not None:
+            layers.label.pop(index, None)
+            layers.frames.pop(index, None)
+        self._dirty = True
+
+    def _fan_geometry(self, ss: int = 1) -> Optional[WheelLayout]:
+        if self._expanded is None or not self._fan_apps:
+            return None
+        ring = self._ring_for(*self._counts(), ss)
+        slice_geom = ring.slice_for(self._expanded)
+        if slice_geom is None:
+            return None
+        span = (slice_geom.start_cw - slice_geom.end_cw) % (2 * math.pi)
+        return build_fan(
+            len(self._fan_apps),
+            ring.cx,
+            ring.cy,
+            self.outer_r * ss * FAN_OUTER,
+            self.outer_r * ss * FAN_INNER,
+            slice_geom.mid,
+            span,
+            min_deg=self.cfg.subring_min_degrees,
+        )
+
+    def fan_step(self, delta: int) -> None:
+        """Move within the fan, opening it on the selection if it is closed.
+
+        Opening still consumes the step, so one `` ` `` lands on the next window
+        rather than merely revealing the one already in front.
+        """
+        if self._expanded is None and not self._enter_fan(self._selected):
+            return
+        count = len(self._fan_apps)
+        if count < 1:
+            return
+        self._fan_selected = (self._fan_selected + delta) % count
+        self._release_mouse()
+        self._fan_dirty(self._expanded)
+        target = self._fan_apps[self._fan_selected]
+        if target.hwnd:
+            self._request_preview(target.hwnd, urgent=True)
+
     def _should_group(self) -> bool:
-        return bool(self.cfg.group_by_app) and not self._query and not self._expand_app
+        return bool(self.cfg.group_by_app) and not self._query
 
     def _present_apps(self, source: list[AppWindow] | None = None) -> list[AppWindow]:
+        """The flat slice list, MRU first then the lane, recording the split.
+
+        Searching drops the lane: a query is asking for a specific window, and a
+        reserved arc for something that did not match would only be in the way.
+        """
         apps = list(self._all_apps if source is None else source)
         if self._query:
+            self._lane_count = 0
             return apps
-        return present_windows(
+        lane, mru = present_windows(
             apps,
             group_by_app=self._should_group(),
-            pinned_exes=self.cfg.pinned_exes,
-            expand_app=self._expand_app,
+            slots=self.cfg.lane_slots(),
         )
+        self._lane_count = len(lane)
+        return mru + lane
 
     def _refresh_visible(self, *, keep_hwnd: int = 0) -> bool:
         """Rebuild the shown list. False if nothing is left (caller should cancel)."""
@@ -932,39 +1228,29 @@ class Overlay:
         return True
 
     def cycle_same_app(self, delta: int) -> None:
-        """Move to the next window belonging to the same application."""
-        current = self.selected_app()
-        if current is None:
-            return
-        key = group_key(current)
-        visible = [i for i, app in enumerate(self._apps) if group_key(app) == key]
-        if len(visible) >= 2:
-            position = visible.index(self._selected) if self._selected in visible else 0
-            self.select(visible[(position + delta) % len(visible)])
-            return
-        peers = [app for app in self._all_apps if group_key(app) == key]
-        if len(peers) < 2:
-            return
-        index = next((i for i, app in enumerate(peers) if app.hwnd == current.hwnd), 0)
-        nxt = peers[(index + delta) % len(peers)]
-        self._bring_peer_to_front(nxt)
-        self._refresh_visible(keep_hwnd=nxt.hwnd)
+        """Step through the windows of the aimed application.
 
-    def _bring_peer_to_front(self, face: AppWindow) -> None:
-        """Make ``face`` the representative of its application group."""
-        key = group_key(face)
-        rebuilt: list[AppWindow] = []
-        seen: set[str] = set()
-        for app in self._all_apps:
-            item_key = group_key(app)
-            if item_key in seen:
-                continue
-            seen.add(item_key)
-            members = [item for item in self._all_apps if group_key(item) == item_key]
-            if item_key == key:
-                members = [face] + [item for item in members if item.hwnd != face.hwnd]
-            rebuilt.extend(members)
-        self._all_apps = rebuilt
+        This used to be two behaviours wearing one name: move the selection when
+        an app's windows happened to be on the ring, otherwise rotate which peer
+        was the group's face and rebuild. The fan is where an app's windows live
+        now, so both collapse into stepping outward into it — the same thing the
+        pointer does by overshooting.
+        """
+        if not self._apps:
+            return
+        if self._expanded is None and not self._fan_entries(self._selected):
+            # Nothing to fan. Fall back to the next slice of the same app, which
+            # is only reachable at all when grouping is off.
+            current = self.selected_slice()
+            if current is None:
+                return
+            key = group_key(current)
+            visible = [i for i, app in enumerate(self._apps) if group_key(app) == key]
+            if len(visible) >= 2:
+                position = visible.index(self._selected) if self._selected in visible else 0
+                self.select(visible[(position + delta) % len(visible)])
+            return
+        self.fan_step(delta)
 
     # -- search ------------------------------------------------------------
 
@@ -982,6 +1268,7 @@ class Overlay:
     def _set_query(self, text: str) -> None:
         self._query = text
         keep_hwnd = self.selected_app().hwnd if self.selected_app() else 0
+        self._collapse_fan()  # typing is a different question from "which window"
         source = list(self._all_apps)
 
         if text:
@@ -1028,9 +1315,10 @@ class Overlay:
     def request_close_selected(self) -> int:
         """Drop the selected window from the wheel and return its hwnd."""
         app = self.selected_app()
-        if app is None:
-            return 0
+        if app is None or not app.hwnd:
+            return 0  # a dead slot or "new window" has no window to act on
         hwnd = app.hwnd
+        self._collapse_fan()
         key = group_key(app)
         self._all_apps = [a for a in self._all_apps if a.hwnd != hwnd]
         self._drop_thumb(hwnd)
@@ -1180,11 +1468,13 @@ class Overlay:
         if self._point_on_wheel(*canvas):
             # Actually on the ring: point at a slice and get that slice.
             vx, vy = canvas[0] - layout.cx, canvas[1] - layout.cy
-            hit = layout.aim(*canvas)
         else:
             # Anywhere else, only the direction of the flick matters.
             vx, vy = dx, dy
-            hit = layout.aim(layout.cx + dx, layout.cy + dy)
+        aim_x, aim_y = layout.cx + vx, layout.cy + vy
+        reach = math.hypot(vx, vy)
+
+        hit = self._aim_radial(layout, aim_x, aim_y, reach)
 
         # `aim` returns None inside the hub dead zone, which is exactly when
         # there is no direction worth drawing.
@@ -1192,6 +1482,47 @@ class Overlay:
 
         if hit is not None and hit != self._selected:
             self.select(hit, from_mouse=True)
+
+    def _aim_radial(
+        self, layout: RingLayout, x: float, y: float, reach: float
+    ) -> Optional[int]:
+        """Resolve a pointer direction against the ring, then against the fan.
+
+        Radial distance was previously measured and thrown away — `aim` used it
+        only to reject the hub dead zone. Spending it on depth is what the
+        sub-ring is; the cost is that the boundary needs memory, because a single
+        threshold chatters as soon as the cursor rests near it.
+        """
+        if not self.cfg.subring:
+            return layout.aim(x, y)
+
+        enter = layout.outer_r * self.cfg.subring_enter
+        exit_at = layout.outer_r * self.cfg.subring_exit
+
+        if self._expanded is not None:
+            if reach < exit_at:
+                self._collapse_fan()
+            else:
+                # Latched: out here the angle is choosing a window, so it must
+                # not also be re-choosing which app is expanded.
+                fan = self._fan_geometry()
+                picked = fan.aim(x, y, min_r=0.0) if fan is not None else None
+                if picked is not None and picked != self._fan_selected:
+                    self._fan_selected = picked
+                    self._fan_dirty(self._expanded)
+                    target = self._fan_apps[picked]
+                    if target.hwnd:
+                        self._request_preview(target.hwnd, urgent=True)
+                return self._expanded
+
+        hit = layout.aim(x, y)
+        if hit is not None and reach >= enter:
+            # Move the selection first: `select` collapses any open fan, so
+            # expanding before selecting would immediately undo itself.
+            if hit != self._selected:
+                self.select(hit, from_mouse=True)
+            self._enter_fan(hit)
+        return hit
 
     # -- origin marker -----------------------------------------------------
 
@@ -1341,7 +1672,8 @@ class Overlay:
         frame = self._compose(now)
         aim = self._aim_angle
         ox, oy = self._wheel_origin
-        settled = not force and self._sel_from < 0 and self._written_index == self._selected
+        key = self._frame_key()
+        settled = not force and self._sel_from < 0 and self._written_frame == key
 
         if settled and self._written_aim == aim:
             # Nothing in the bitmap changed, so the DIB already holds this frame.
@@ -1356,7 +1688,7 @@ class Overlay:
                 frame = frame.copy()
                 self._draw_needle(frame, aim)
             self._wheel.paint(frame, ox, oy + rise, opacity=opacity)
-            self._written_index = self._selected if self._sel_from < 0 else -1
+            self._written_frame = key if self._sel_from < 0 else None
             self._written_aim = aim
 
         if self.cfg.preview_enabled:
@@ -1452,14 +1784,36 @@ class Overlay:
                 # layers that moved sounds cheaper, but it needs a copy of the
                 # base plus five composites, which measures slightly slower
                 # than letting Pillow blend the whole canvas in C.
-                return Image.blend(
+                blended = Image.blend(
                     self._frame_for(self._sel_from),
                     self._frame_for(self._selected),
                     _ease_out_cubic(max(0.0, t)),
                 )
+                fan = self._fan_layer()
+                if fan is not None:
+                    blended.alpha_composite(fan.img, fan.pos)  # already a fresh image
+                return blended
 
         self._sel_from = -1
-        return self._frame_for(self._selected)
+        return self._with_fan(self._frame_for(self._selected))
+
+    def _frame_key(self) -> tuple:
+        """Everything the finished bitmap depends on besides animation time."""
+        return (self._selected, self._expanded, self._fan_selected, len(self._fan_apps))
+
+    def _with_fan(self, frame: Image.Image) -> Image.Image:
+        fan = self._fan_layer()
+        if fan is None:
+            return frame
+        key = self._frame_key()
+        cached = self._fan_frames.get(key)
+        if cached is not None:
+            return cached
+        out = frame.copy()
+        out.alpha_composite(fan.img, fan.pos)
+        self._fan_frames[key] = out
+        _trim(self._fan_frames, 8)
+        return out
 
     def _frame_for(self, index: int) -> Image.Image:
         layers = self._layers
@@ -1468,11 +1822,16 @@ class Overlay:
         if cached is not None:
             return cached
         frame = layers.base.copy()
-        for cache, build in (
-            (layers.hl, self._build_highlight),
-            (layers.hub, self._build_hub),
-            (layers.label, self._build_label),
-        ):
+        highlight = layers.hl.get(index)
+        if highlight is None:
+            highlight = self._build_highlight(index)
+            if highlight is not None:
+                layers.hl[index] = highlight
+        if highlight is not None:
+            frame.alpha_composite(highlight.img, highlight.pos)
+        if layers.marks is not None:
+            frame.alpha_composite(layers.marks, (0, 0))
+        for cache, build in ((layers.hub, self._build_hub), (layers.label, self._build_label)):
             layer = cache.get(index)
             if layer is None:
                 layer = build(index)
@@ -1484,6 +1843,131 @@ class Overlay:
         _trim(layers.frames, 16)
         return frame
 
+    def _fan_layer(self) -> Optional[Layer]:
+        """The open fan, cached on what it contains rather than on the selection.
+
+        The band itself changes only when a different app is expanded. Which
+        entry is highlighted changes on every flick, so that part is drawn on
+        top of the cached band instead of being baked into it.
+        """
+        if self._expanded is None or not self._fan_apps:
+            return None
+        app = self._apps[self._expanded] if self._expanded < len(self._apps) else None
+        if app is None:
+            return None
+
+        key = (
+            self._metrics_signature(),
+            self._counts(),
+            self._expanded,
+            group_key(app),
+            tuple(a.hwnd for a in self._fan_apps),
+            min(self._fan_selected, len(self._fan_apps) - 1),
+        )
+        cached = self._fan_cache.get(key)
+        if cached is not None:
+            return cached
+
+        ss = RENDER_SCALE
+        theme = self.theme
+        fan = self._fan_geometry(ss)
+        if fan is None or not fan.slices:
+            return None
+
+        inner, outer = fan.inner_r, fan.outer_r
+        pad = 6 * ss
+        x0 = max(0, int(fan.cx - outer - pad))
+        y0 = max(0, int(fan.cy - outer - pad))
+        x1 = min(self.canvas_w * ss, int(fan.cx + outer + pad) + 1)
+        y1 = min(self.canvas_h * ss, int(fan.cy + outer + pad) + 1)
+        x0, y0 = _floor_to(x0, ss), _floor_to(y0, ss)
+        x1, y1 = _ceil_to(x1, ss), _ceil_to(y1, ss)
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        sub = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(sub, "RGBA")
+        stroke = max(2, 2 * ss)
+        chosen = min(self._fan_selected, len(fan.slices) - 1)
+
+        for geom in fan.slices:
+            entry = self._fan_apps[geom.index]
+            current = geom.index == chosen
+            points = pie_points(
+                fan.cx - x0,
+                fan.cy - y0,
+                inner,
+                outer,
+                geom.start_cw,
+                geom.end_cw,
+                steps=64,
+            )
+            fill = theme.slice_hover if current else alpha(theme.ring_fill, 238)
+            draw.polygon(points, fill=fill)
+            draw.line(
+                points + [points[0]],
+                fill=alpha(theme.accent, 255) if current else theme.ring_edge,
+                width=stroke if current else max(1, stroke // 2),
+            )
+            if entry.hwnd == 0:
+                self._draw_plus(draw, geom, x0, y0, inner, outer, ss, current)
+            else:
+                self._draw_fan_number(draw, geom, x0, y0, inner, outer, ss, current, entry)
+
+        layer = Layer(sub.reduce(ss), (x0 // ss, y0 // ss))
+        self._fan_cache[key] = layer
+        _trim(self._fan_cache, 24)
+        return layer
+
+    def _draw_fan_number(
+        self,
+        draw: ImageDraw.ImageDraw,
+        geom,
+        x0: int,
+        y0: int,
+        inner: float,
+        outer: float,
+        ss: int,
+        current: bool,
+        entry: AppWindow,
+    ) -> None:
+        """A numeral per fan entry.
+
+        Every window of an app shares its icon, so an icon here would say nothing
+        the slice has not already said. The position does distinguish them, and it
+        is the same number the label counts off and the pips show, so the fan can
+        be counted rather than read.
+        """
+        radius = (inner + outer) / 2
+        px = self.wheel_cx * ss - x0 + math.cos(geom.mid) * radius
+        py = self.wheel_cy * ss - y0 - math.sin(geom.mid) * radius
+        colour = self.theme.text if current else self.theme.text_dim
+        if entry.minimized:
+            colour = alpha(colour, 150)
+        font = _font(TITLE_FONTS, 15 * self.s * ss)
+        _centered(draw, str(geom.index + 1), px, py - 9 * self.s * ss, font, colour)
+
+    def _draw_plus(
+        self,
+        draw: ImageDraw.ImageDraw,
+        geom,
+        x0: int,
+        y0: int,
+        inner: float,
+        outer: float,
+        ss: int,
+        current: bool,
+    ) -> None:
+        """A plus in the "new window" entry, so it is not read as a window."""
+        radius = (inner + outer) / 2
+        px = self.wheel_cx * ss - x0 + math.cos(geom.mid) * radius
+        py = self.wheel_cy * ss - y0 - math.sin(geom.mid) * radius
+        arm = 5 * self.s * ss
+        width = max(2, int(round(1.8 * self.s)) * ss)
+        colour = self.theme.text if current else self.theme.text_dim
+        draw.line((px - arm, py, px + arm, py), fill=colour, width=width)
+        draw.line((px, py - arm, px, py + arm), fill=colour, width=width)
+
     # -- layer construction ------------------------------------------------
 
     def _rebuild_layers(self) -> None:
@@ -1494,6 +1978,9 @@ class Overlay:
             self._metrics_signature(),
             tuple(a.hwnd for a in self._apps),
             tuple(a.title for a in self._apps),
+            tuple(a.slot for a in self._apps),
+            tuple(a.group_count for a in self._apps),
+            self._lane_count,
             bool(self._query),
             self._query,
         )
@@ -1503,32 +1990,25 @@ class Overlay:
             self._layers = cached
             return
 
+        self._fan_frames.clear()  # they hold copies of the old base
         layers = WheelLayers(
-            base=self._build_base(),
-            layout=build_layout(
-                len(self._apps),
-                float(self.wheel_cx),
-                float(self.wheel_cy),
-                float(self.outer_r),
-                float(self.inner_r),
-            ),
+            base=self._build_base(), layout=self._layout_1x(), marks=self._build_marks()
         )
         self._layers = layers
         self._layer_cache[signature] = layers
         while len(self._layer_cache) > 4:
             self._layer_cache.popitem(last=False)
 
-    def _hi_layout(self) -> WheelLayout:
-        return self._hi_layout_for(len(self._apps))
-
-    def _hi_layout_for(self, count: int) -> WheelLayout:
-        ss = RENDER_SCALE
-        return build_layout(
-            count,
+    def _ring_for(self, mru_count: int, lane_count: int, ss: int = 1) -> RingLayout:
+        return build_wheel(
+            mru_count,
+            lane_count,
             float(self.wheel_cx * ss),
             float(self.wheel_cy * ss),
             float(self.outer_r * ss),
             float(self.inner_r * ss),
+            slot_deg=self.cfg.pin_slot_degrees,
+            gap_deg=self.cfg.pin_gap_degrees,
         )
 
     def _icon_at(self, app: AppWindow, size: int) -> Optional[Image.Image]:
@@ -1563,32 +2043,56 @@ class Overlay:
         supersampled geometry is rendered once per (metrics, count) and simply
         copied afterwards. Re-ordering the wheel then costs a memcpy.
         """
-        base = self._ring_plate(len(self._apps)).copy()
-        layout = build_layout(
-            len(self._apps),
-            float(self.wheel_cx),
-            float(self.wheel_cy),
-            float(self.outer_r),
-            float(self.inner_r),
-        )
+        mru_count, lane_count = self._counts()
+        base = self._ring_plate(mru_count, lane_count).copy()
+        layout = self._ring_for(mru_count, lane_count)
         icon_px = self._icon_size(1)
         for slice_geom in layout.slices:
             app = self._apps[slice_geom.index]
             icon = self._icon_variant(app, icon_px, idle=True)
-            if icon is None:
-                continue
-            base.alpha_composite(
-                icon,
-                (
-                    int(slice_geom.icon_x - icon_px / 2),
-                    int(slice_geom.icon_y - icon_px / 2),
-                ),
-            )
+            if icon is not None:
+                base.alpha_composite(
+                    icon,
+                    (
+                        int(slice_geom.icon_x - icon_px / 2),
+                        int(slice_geom.icon_y - icon_px / 2),
+                    ),
+                )
         return base
 
-    def _ring_plate(self, count: int) -> Image.Image:
-        """Shadow + ring + dividers: everything that only depends on the count."""
-        key = (self._metrics_signature(), count)
+    def _build_marks(self) -> Optional[Image.Image]:
+        """Rim decoration for every slice: window pips, and dashed dead slots.
+
+        Both say something the label can only say once the slice is already
+        selected, which is too late to be useful — the point of a weapon wheel is
+        that the whole thing is readable at a glance, before committing.
+
+        Composited above the highlight rather than into the base, because the
+        highlight wedge covers the rim, and the selected slice is exactly the one
+        whose depth the user is deciding about.
+        """
+        marks: Optional[Image.Image] = None
+        for slice_geom in self._ring_for(*self._counts()).slices:
+            app = self._apps[slice_geom.index]
+            if app.is_dead:
+                plate = self._dead_rim(slice_geom.start_cw, slice_geom.end_cw)
+            elif self.cfg.group_pips and app.group_count > 1:
+                face = app.peer_hwnds.index(app.hwnd) if app.hwnd in app.peer_hwnds else 0
+                plate = self._pips(
+                    app.group_count, face, slice_geom.start_cw, slice_geom.end_cw
+                )
+            else:
+                continue
+            if plate is None:
+                continue
+            if marks is None:
+                marks = Image.new("RGBA", (self.canvas_w, self.canvas_h), (0, 0, 0, 0))
+            marks.alpha_composite(plate, (0, 0))
+        return marks
+
+    def _ring_plate(self, mru_count: int, lane_count: int = 0) -> Image.Image:
+        """Shadow + ring + dividers: everything that only depends on the counts."""
+        key = (self._metrics_signature(), mru_count, lane_count)
         cached = self._plate_cache.get(key)
         if cached is not None:
             return cached
@@ -1598,28 +2102,54 @@ class Overlay:
         width, height = self.canvas_w * ss, self.canvas_h * ss
         cx, cy = self.wheel_cx * ss, self.wheel_cy * ss
         outer, inner = self.outer_r * ss, self.inner_r * ss
+        stroke = max(2, 2 * ss)
 
         img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img, "RGBA")
 
+        ring = self._ring_for(mru_count, lane_count, ss)
         shade = theme.shadow
         steps = (26, 38, 54) if theme.is_dark else (12, 18, 26)
         for index, opacity in enumerate(steps):
             pad = (20 - index * 6) * ss
+            colour = (shade[0], shade[1], shade[2], opacity)
+            if not ring.bands:
+                draw.ellipse(
+                    (cx - outer - pad, cy - outer - pad, cx + outer + pad, cy + outer + pad),
+                    fill=colour,
+                )
+                continue
+            # Follow the bands rather than the whole circle. A disc of shadow
+            # would show through the gaps as pale wedges, which reads as a
+            # region of the wheel rather than as the absence of one.
+            for start_cw, end_cw in ring.bands:
+                draw.polygon(
+                    pie_points(cx, cy, inner, outer + pad, start_cw, end_cw, steps=96),
+                    fill=colour,
+                )
+
+        if not ring.bands:
             draw.ellipse(
-                (cx - outer - pad, cy - outer - pad, cx + outer + pad, cy + outer + pad),
-                fill=(shade[0], shade[1], shade[2], opacity),
+                (cx - outer, cy - outer, cx + outer, cy + outer),
+                fill=theme.ring_fill,
+                outline=theme.ring_edge,
+                width=stroke,
             )
+        else:
+            # The lane is separated from the MRU slices by empty arc rather than
+            # by a drawn line: a line reads as decoration, a gap reads as two
+            # regions. So the ring becomes one filled band per region.
+            #
+            # Bands run a little under `inner` so the hub disc, drawn over them
+            # later at exactly `inner`, covers the antialiased inner edge
+            # instead of leaving a hairline where the two meet.
+            for start_cw, end_cw in ring.bands:
+                points = pie_points(cx, cy, inner - stroke, outer, start_cw, end_cw, steps=96)
+                draw.polygon(points, fill=theme.ring_fill)
+                draw.line(points + [points[0]], fill=theme.ring_edge, width=stroke)
 
-        draw.ellipse(
-            (cx - outer, cy - outer, cx + outer, cy + outer),
-            fill=theme.ring_fill,
-            outline=theme.ring_edge,
-            width=max(2, 2 * ss),
-        )
-
-        if count > 1:
-            for slice_geom in self._hi_layout_for(count).slices:
+        if mru_count + lane_count > 1:
+            for slice_geom in ring.slices:
                 angle = slice_geom.start_cw
                 draw.line(
                     (
@@ -1629,7 +2159,7 @@ class Overlay:
                         cy - math.sin(angle) * outer,
                     ),
                     fill=theme.divider,
-                    width=max(2, 2 * ss),
+                    width=stroke,
                 )
 
         # An exact 2x box reduce is the correct resolve for a supersampled
@@ -1640,19 +2170,110 @@ class Overlay:
             self._plate_cache.pop(next(iter(self._plate_cache)))
         return plate
 
+    def _pips(
+        self, count: int, face: int, start_cw: float, end_cw: float
+    ) -> Optional[Image.Image]:
+        """One dot per window just inside the rim, the current face filled.
+
+        Count and position in one glance, which is what a weapon wheel does with
+        ammo. It also stops the sub-ring being a surprise: you can see which
+        slices have depth before overshooting one.
+
+        Capped because past about seven the dots stop being countable and start
+        being texture, and a crowded slice has no room for them anyway.
+        """
+        shown = min(count, 7)
+        key = (self._metrics_signature(), shown, min(face, shown - 1), round(start_cw, 4), round(end_cw, 4))
+        cached = self._pip_cache.get(key)
+        if cached is not None:
+            return cached
+
+        ss = RENDER_SCALE
+        theme = self.theme
+        cx, cy = self.wheel_cx * ss, self.wheel_cy * ss
+        radius = self.outer_r * ss - 8 * self.s * ss
+        dot = max(1.6, 2.2 * self.s) * ss
+        span = (start_cw - end_cw) % (2 * math.pi)
+        # Keep the row clear of the slice's own edges, so neighbouring slices'
+        # pips never look like one run of dots.
+        usable = span * 0.62
+        step = usable / max(1, shown - 1) if shown > 1 else 0.0
+        first = (start_cw - span / 2) + (usable / 2 if shown > 1 else 0.0)
+
+        img = Image.new("RGBA", (self.canvas_w * ss, self.canvas_h * ss), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img, "RGBA")
+        for i in range(shown):
+            angle = first - i * step
+            px = cx + math.cos(angle) * radius
+            py = cy - math.sin(angle) * radius
+            current = i == min(face, shown - 1)
+            fill = alpha(theme.accent, 255) if current else alpha(theme.text, 165)
+            grow = dot * (1.3 if current else 1.0)
+            draw.ellipse((px - grow, py - grow, px + grow, py + grow), fill=fill)
+
+        plate = img.reduce(ss)
+        self._pip_cache[key] = plate
+        _trim(self._pip_cache, 64)
+        return plate
+
+    def _dead_rim(self, start_cw: float, end_cw: float) -> Optional[Image.Image]:
+        """A dashed outer edge marking a slot whose app is not running.
+
+        Worth more than it looks: mistaking "launch" for "switch" trades a 14ms
+        switch for an unexpected multi-second cold start, so the two states have
+        to be tellable apart without reading anything.
+        """
+        key = (self._metrics_signature(), "dead", round(start_cw, 4), round(end_cw, 4))
+        cached = self._pip_cache.get(key)
+        if cached is not None:
+            return cached
+
+        ss = RENDER_SCALE
+        theme = self.theme
+        cx, cy = self.wheel_cx * ss, self.wheel_cy * ss
+        radius = self.outer_r * ss - 3 * self.s * ss
+        span = (start_cw - end_cw) % (2 * math.pi)
+        width = max(2, int(round(2.0 * self.s)) * ss)
+
+        img = Image.new("RGBA", (self.canvas_w * ss, self.canvas_h * ss), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img, "RGBA")
+        dashes = max(3, int(span / math.radians(3.2)) | 1)
+        for i in range(0, dashes, 2):
+            a0 = start_cw - span * (i / dashes)
+            a1 = start_cw - span * ((i + 1) / dashes)
+            draw.line(
+                (
+                    cx + math.cos(a0) * radius,
+                    cy - math.sin(a0) * radius,
+                    cx + math.cos(a1) * radius,
+                    cy - math.sin(a1) * radius,
+                ),
+                fill=alpha(theme.text_dim, 170),
+                width=width,
+            )
+
+        plate = img.reduce(ss)
+        self._pip_cache[key] = plate
+        _trim(self._pip_cache, 64)
+        return plate
+
     def _icon_variant(
         self, app: AppWindow, size: int, *, idle: bool
     ) -> Optional[Image.Image]:
         """Icon as drawn on the wheel: unselected icons sit back a little."""
         if app.icon is None or size < 4:
             return None
-        key = (id(app.icon), size, idle, app.minimized)
+        key = (id(app.icon), size, idle, app.minimized, app.is_dead)
         cached = self._icon_variants.get(key)
         if cached is not None:
             return cached
         icon = self._icon_at(app, size)
         if icon is None:
             return None
+        if app.is_dead:
+            # Desaturated rather than merely dimmed: a dim icon reads as
+            # "minimised", which is a window that exists.
+            icon = _desaturate(icon, 0.88 if idle else 0.6)
         if app.minimized:
             icon = _dim_image(icon, 0.55 if idle else 0.72)
         if idle:
@@ -1660,14 +2281,8 @@ class Overlay:
         self._icon_variants[key] = icon
         return icon
 
-    def _layout_1x(self) -> WheelLayout:
-        return build_layout(
-            len(self._apps),
-            float(self.wheel_cx),
-            float(self.wheel_cy),
-            float(self.outer_r),
-            float(self.inner_r),
-        )
+    def _layout_1x(self) -> RingLayout:
+        return self._ring_for(*self._counts())
 
     def _highlight_icon_px(self, ss: int) -> int:
         return max(8, int(self._icon_size(ss) * 1.12) // 2 * 2)
@@ -1685,7 +2300,9 @@ class Overlay:
         if icon is None:
             return wedge
 
-        slice_geom = self._layout_1x().slices[index]
+        slice_geom = self._layout_1x().slice_for(index)
+        if slice_geom is None:
+            return wedge
         img = wedge.img.copy()
         img.alpha_composite(
             icon,
@@ -1697,22 +2314,24 @@ class Overlay:
         return Layer(img, wedge.pos)
 
     def _wedge(self, index: int) -> Optional[Layer]:
-        """Highlight geometry only — depends on the slice count, not the apps."""
-        count = len(self._apps)
-        key = (self._metrics_signature(), count, index)
+        """Highlight geometry only — depends on the slice counts, not the apps."""
+        mru_count, lane_count = self._counts()
+        key = (self._metrics_signature(), mru_count, lane_count, index)
         cached = self._wedge_cache.get(key)
         if cached is not None:
             return cached
 
         ss = RENDER_SCALE
         theme = self.theme
-        layout = self._hi_layout_for(count)
-        slice_geom = layout.slices[index]
+        layout = self._ring_for(mru_count, lane_count, ss)
+        slice_geom = layout.slice_for(index)
+        if slice_geom is None:
+            return None
         outer, inner = self.outer_r * ss, self.inner_r * ss
 
         points = pie_points(
             layout.cx, layout.cy, inner, outer, slice_geom.start_cw, slice_geom.end_cw, steps=72
-        )
+        )  # cx/cy come from the layout so the supersampled scale is already applied
         icon_px = self._icon_size(ss)
         icon_px = int(icon_px * 1.12) // 2 * 2
 
@@ -1803,13 +2422,46 @@ class Overlay:
         _trim(self._hub_cache, 96)
         return layer
 
+    def _hint_for(self, app: AppWindow, fan_entry: Optional[AppWindow]) -> str:
+        """The bottom line: whichever affordance this slice actually has."""
+        from .hotkey import parse_hotkey
+
+        hotkey = parse_hotkey(self.cfg.open_hotkey).label()
+        if fan_entry is not None:
+            if fan_entry.hwnd == 0:
+                return f"{hotkey} · launches a new window · Esc cancel"
+            return f"{hotkey} · ` next window · pull back for apps"
+        if app.is_dead:
+            return f"{hotkey} · not running, will launch · Esc cancel"
+        if app.group_count > 1 and self.cfg.subring:
+            return f"{hotkey} · reach further out for windows · Esc cancel"
+        if app.group_count > 1:
+            return f"{hotkey} · ` next window · Esc cancel"
+        return f"{hotkey} · type to search · Esc cancel"
+
+    def _slice_title(self, app: AppWindow) -> str:
+        """What the label calls this slice.
+
+        A grouped slice is named after the *application*, not after whichever of
+        its windows happens to be most recent. The old behaviour gave a grouped
+        app a different label on every open, which fought the muscle memory the
+        wheel is built on: stable identity beats freshness, and the fan owns
+        window titles now.
+        """
+        if app.group_count > 1:
+            return (app.app_name or app.exe_name or app.display_name).strip()
+        return app.label(title_privacy=self.cfg.title_privacy)
+
     def _build_label(self, index: int) -> Optional[Layer]:
         if not (0 <= index < len(self._apps)):
             return None
         app = self._apps[index]
         # Deliberately not keyed by position: the label says nothing about where
         # the slice sits, so re-ordering the wheel reuses every label.
-        title = app.label(title_privacy=self.cfg.title_privacy)
+        title = self._slice_title(app)
+        fan_entry = None
+        if self._expanded == index and self._fan_apps:
+            fan_entry = self._fan_apps[min(self._fan_selected, len(self._fan_apps) - 1)]
         key = (
             self._metrics_signature(),
             title,
@@ -1817,6 +2469,12 @@ class Overlay:
             app.minimized,
             app.maximized,
             app.group_count,
+            app.is_dead,
+            app.is_pinned,
+            fan_entry.hwnd if fan_entry is not None else -1,
+            fan_entry.title if fan_entry is not None else "",
+            self._fan_selected if fan_entry is not None else -1,
+            len(self._fan_apps),
             self._query,
             self._query_matched,
             self.compat_active,
@@ -1848,23 +2506,37 @@ class Overlay:
         hint_font = _font(BODY_FONTS, 11.5 * self.s)
 
         y = 14 * self.s * ss
-        title = _ellipsize(draw, title, title_font, max_width)
-        _centered(draw, title, centre + ss, y + ss, title_font, (0, 0, 0, 120))
-        _centered(draw, title, centre, y, title_font, theme.text)
+        # In the fan the title band belongs to the window being pointed at; the
+        # app name moves down to the subtitle, so both stay visible.
+        if fan_entry is not None and fan_entry.hwnd:
+            headline = fan_entry.label(title_privacy=self.cfg.title_privacy)
+        elif fan_entry is not None:
+            headline = f"New {title} window"
+        else:
+            headline = title
+        headline = _ellipsize(draw, headline, title_font, max_width)
+        _centered(draw, headline, centre + ss, y + ss, title_font, (0, 0, 0, 120))
+        _centered(draw, headline, centre, y, title_font, theme.text)
 
         y += 22 * self.s * ss
         if self.cfg.show_subtitle:
             parts = []
-            if self.cfg.title_privacy == "full":
-                subtitle = app.subtitle
-                if subtitle:
-                    parts.append(subtitle)
-            if app.minimized:
-                parts.append("minimised")
-            elif app.maximized:
-                parts.append("maximised")
-            if app.group_count > 1:
-                parts.append(f"{app.group_count} windows")
+            if fan_entry is not None:
+                parts.append(title)
+                parts.append(f"{self._fan_selected + 1} of {len(self._fan_apps)}")
+            else:
+                if self.cfg.title_privacy == "full":
+                    subtitle = app.subtitle
+                    if subtitle:
+                        parts.append(subtitle)
+                if app.is_dead:
+                    parts.append("not running")
+                if app.minimized:
+                    parts.append("minimised")
+                elif app.maximized:
+                    parts.append("maximised")
+                if app.group_count > 1:
+                    parts.append(f"{app.group_count} windows")
             line = _ellipsize(draw, "  ·  ".join(parts), sub_font, max_width)
             if line:
                 _centered(draw, line, centre, y, sub_font, theme.text_dim)
@@ -1877,14 +2549,9 @@ class Overlay:
                 draw, _ellipsize(draw, text, hint_font, max_width), centre, y, hint_font, colour
             )
         elif self.cfg.show_hints:
-            from .hotkey import parse_hotkey
-
-            hint = f"{parse_hotkey(self.cfg.open_hotkey).label()} · type to search · Esc cancel"
-            if app.group_count > 1:
-                hint = f"{parse_hotkey(self.cfg.open_hotkey).label()} · ` next window · Esc cancel"
             _centered(
                 draw,
-                _ellipsize(draw, hint, hint_font, max_width),
+                _ellipsize(draw, self._hint_for(app, fan_entry), hint_font, max_width),
                 centre,
                 y,
                 hint_font,
@@ -2062,11 +2729,15 @@ class Overlay:
         if force or key != self._card_key:
             self._card_key = key
             self._preview_t0 = now
-            card = self._card_cache.get(key)
-            if card is None:
-                card = self._build_card(app)
-                self._card_cache[key] = card
-                _trim(self._card_cache, 12)
+            if not app.hwnd:
+                name = (app.app_name or app.exe_name or "This app").strip()
+                card = self._status_card(app, name, "not running · Enter to start it")
+            else:
+                card = self._card_cache.get(key)
+                if card is None:
+                    card = self._build_card(app)
+                    self._card_cache[key] = card
+                    _trim(self._card_cache, 12)
             if not self._preview.ensure(*card.size):
                 return
             self._preview.write(card)
@@ -2187,6 +2858,16 @@ def _ceil_to(value: int, step: int) -> int:
 def _dim_image(img: Image.Image, factor: float) -> Image.Image:
     arr = np.array(img, dtype=np.uint8)
     arr[..., :3] = (arr[..., :3].astype(np.float32) * factor).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
+
+
+def _desaturate(img: Image.Image, amount: float) -> Image.Image:
+    """Pull an icon towards grey, keeping its alpha untouched."""
+    arr = np.array(img, dtype=np.uint8)
+    rgb = arr[..., :3].astype(np.float32)
+    grey = rgb @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    blended = rgb + (grey[..., None] - rgb) * max(0.0, min(1.0, amount))
+    arr[..., :3] = np.clip(blended, 0, 255).astype(np.uint8)
     return Image.fromarray(arr, "RGBA")
 
 

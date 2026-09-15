@@ -134,10 +134,8 @@ def test_group_by_app_is_on_by_default():
 
 
 def test_exe_lists_are_normalised_on_clamp():
-    cfg = Config(
-        exclude_exes=["Chrome", r"C:\Apps\Slack.EXE", "chrome.exe", ""],
-        pinned_exes=["Spotify", "chrome"],
-    )
+    cfg = Config(exclude_exes=["Chrome", r"C:\Apps\Slack.EXE", "chrome.exe", ""])
+    cfg.set_slot_order(["Spotify", "chrome"])
     cfg.clamp()
     assert cfg.exclude_exes == ["chrome.exe", "slack.exe"]
     assert cfg.pinned_exes == ["spotify.exe"], "a hidden app cannot also be pinned"

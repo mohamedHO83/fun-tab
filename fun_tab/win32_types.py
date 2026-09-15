@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 from ctypes import wintypes
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -995,3 +996,169 @@ user32.RegisterWindowMessageW.restype = wintypes.UINT
 
 def message_box(text: str, title: str = "Fun Tab", flags: int = MB_OK | MB_ICONINFORMATION) -> int:
     return int(user32.MessageBoxW(None, text, title, flags | MB_SETFOREGROUND | MB_TOPMOST))
+
+
+# ---------------------------------------------------------------------------
+# AppUserModelID, and launching an app that is not running
+# ---------------------------------------------------------------------------
+#
+# The taskbar groups windows by AppUserModelID, not by executable, which is why
+# every Chrome profile and every installed PWA gets its own button there while
+# they all share one exe path. Reading the same property is the only way to
+# group the wheel the way the user already sees their taskbar grouped.
+
+ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+
+COINIT_APARTMENTTHREADED = 0x2
+RPC_E_CHANGED_MODE = -2147417850
+
+SW_SHOWNORMAL = 1
+
+
+class PROPERTYKEY(ctypes.Structure):
+    _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+
+class PROPVARIANT(ctypes.Structure):
+    """Only the string case is modelled; the tail keeps the union's real size.
+
+    A short read here would let ``PropVariantClear`` walk off the end of the
+    allocation, so the padding matters even though nothing reads it.
+    """
+
+    _fields_ = [
+        ("vt", wintypes.USHORT),
+        ("wReserved1", wintypes.USHORT),
+        ("wReserved2", wintypes.USHORT),
+        ("wReserved3", wintypes.USHORT),
+        ("pwszVal", ctypes.c_wchar_p),
+        ("_tail", ctypes.c_void_p),
+    ]
+
+
+VT_LPWSTR = 31
+
+# {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5
+PKEY_AppUserModel_ID = PROPERTYKEY(
+    GUID(
+        0x9F4C2855,
+        0x9F79,
+        0x4B39,
+        (ctypes.c_ubyte * 8)(0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3),
+    ),
+    5,
+)
+
+# IID_IPropertyStore {886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}
+_IID_IPropertyStore = GUID(
+    0x886D8EEB,
+    0x8CF2,
+    0x4446,
+    (ctypes.c_ubyte * 8)(0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99),
+)
+
+shell32.SHGetPropertyStoreForWindow.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(GUID),
+    ctypes.POINTER(ctypes.c_void_p),
+]
+shell32.SHGetPropertyStoreForWindow.restype = ctypes.HRESULT
+shell32.ShellExecuteW.argtypes = [
+    wintypes.HWND,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    ctypes.c_int,
+]
+shell32.ShellExecuteW.restype = wintypes.HINSTANCE
+ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+ole32.CoInitializeEx.restype = ctypes.c_long  # not HRESULT: S_FALSE is not an error
+ole32.PropVariantClear.argtypes = [ctypes.POINTER(PROPVARIANT)]
+ole32.PropVariantClear.restype = ctypes.c_long
+
+# vtable slots: IUnknown is 0-2, so IPropertyStore::GetValue is the sixth entry.
+_VT_RELEASE = 2
+_VT_GET_VALUE = 5
+
+_ReleaseProto = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+_GetValueProto = ctypes.WINFUNCTYPE(
+    ctypes.c_long,
+    ctypes.c_void_p,
+    ctypes.POINTER(PROPERTYKEY),
+    ctypes.POINTER(PROPVARIANT),
+)
+
+_com_state = threading.local()
+
+
+def ensure_com() -> bool:
+    """Initialise COM once for the calling thread.
+
+    ``SHGetPropertyStoreForWindow`` needs an initialised apartment. Another
+    library may have already picked a different one, which is reported rather
+    than being an error, so a changed mode still counts as usable.
+    """
+    if getattr(_com_state, "ready", False):
+        return True
+    try:
+        hr = int(ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED))
+    except OSError:
+        return False
+    _com_state.ready = hr >= 0 or hr == RPC_E_CHANGED_MODE
+    return bool(_com_state.ready)
+
+
+def _property_store_string(hwnd: int, key: PROPERTYKEY) -> str:
+    store = ctypes.c_void_p()
+    try:
+        hr = shell32.SHGetPropertyStoreForWindow(
+            hwnd, ctypes.byref(_IID_IPropertyStore), ctypes.byref(store)
+        )
+    except OSError:
+        return ""
+    if hr != 0 or not store.value:
+        return ""
+
+    vtable = ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    try:
+        value = PROPVARIANT()
+        if _GetValueProto(vtable[_VT_GET_VALUE])(store, ctypes.byref(key), ctypes.byref(value)) != 0:
+            return ""
+        try:
+            text = value.pwszVal if value.vt == VT_LPWSTR and value.pwszVal else ""
+            return (text or "").strip()
+        finally:
+            ole32.PropVariantClear(ctypes.byref(value))
+    finally:
+        _ReleaseProto(vtable[_VT_RELEASE])(store)
+
+
+def window_app_id(hwnd: int) -> str:
+    """The window's AppUserModelID, or "" when it does not declare one.
+
+    Most plain Win32 apps do not, which is fine: the caller falls back to the
+    executable path and gets exactly the old behaviour.
+    """
+    if not hwnd or not ensure_com():
+        return ""
+    try:
+        return _property_store_string(int(hwnd), PKEY_AppUserModel_ID)
+    except Exception:
+        return ""
+
+
+def shell_execute(target: str) -> bool:
+    """Launch a file, shortcut or ``shell:AppsFolder\\<AUMID>`` URI.
+
+    ShellExecute is the one call that handles all three, so a packaged app and
+    a plain exe do not need separate launch paths. Return codes at or below 32
+    are the documented failure range.
+    """
+    if not target:
+        return False
+    try:
+        result = shell32.ShellExecuteW(None, "open", target, None, None, SW_SHOWNORMAL)
+    except OSError:
+        return False
+    return int(result or 0) > 32

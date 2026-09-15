@@ -2,7 +2,7 @@
 ; packed dist\FunTab\FunTab.exe. `build.bat` will do that when ISCC is on PATH.
 
 #define MyAppName "Fun Tab"
-#define MyAppVersion "0.3.0"
+#define MyAppVersion "0.4.0"
 #define MyAppPublisher "Fun Tab"
 #define MyAppURL "https://github.com"
 #define MyAppExeName "FunTab.exe"

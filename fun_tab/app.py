@@ -20,9 +20,15 @@ from .windows_enum import (
     close_window,
     enumerate_windows,
     foreground_hwnd,
+    launch_app,
+    launch_target,
     minimize_window,
     present_windows,
 )
+
+# How long the launching card waits for the new window before giving up. Long
+# enough for a cold start off a slow disk, short enough not to look stuck.
+LAUNCH_TIMEOUT = 8.0
 
 
 def _config_stamp(path=None) -> tuple:
@@ -71,6 +77,10 @@ class FunTabApp:
         self._close_confirmed_session = False
         self._paused_manually = False
         self._menu_open = False
+        # Launch feedback: which window was in front when we started something,
+        # so the first unrelated foreground change can dismiss the card.
+        self._launch_at = 0.0
+        self._launch_from = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -80,7 +90,7 @@ class FunTabApp:
             on_commit=self.commit, on_cancel=self.cancel, on_context=self._slice_menu
         )
 
-        self.tracker.install()
+        self.tracker.install(on_foreground=self._note_foreground)
 
         self.hook.is_open = lambda: self.overlay.visible
         self.hook.is_sticky = lambda: self.overlay.sticky
@@ -266,41 +276,52 @@ class FunTabApp:
                 rank=self.tracker.rank if cfg.mru_order else None,
                 minimized_last=cfg.minimized_last,
             )
-            if same_app and apps:
-                apps = self._same_app_peers(apps)
-            shown = present_windows(
-                apps,
-                group_by_app=cfg.group_by_app,
-                pinned_exes=cfg.pinned_exes,
-                expand_app=same_app,
+            lane, mru = present_windows(
+                apps, group_by_app=cfg.group_by_app, slots=cfg.lane_slots()
             )
+            shown = mru + lane
             if not shown:
                 return
 
-            if reverse:
-                selected = len(shown) - 1
-            else:
-                selected = 1 if len(shown) > 1 else 0
+            selected = self._initial_index(
+                shown, len(mru), reverse=reverse, same_app=same_app
+            )
             self.overlay.show(
-                apps, selected=selected, sticky=sticky, expand_app=same_app
+                apps, selected=selected, sticky=sticky, expand_fan=same_app
             )
 
     @staticmethod
-    def _same_app_peers(apps: list) -> list:
-        """Windows belonging to the focused app, that app's window first.
+    def _initial_index(
+        shown: list, mru_count: int, *, reverse: bool, same_app: bool
+    ) -> int:
+        """Which slice the wheel opens on.
 
-        The reference has to be the real foreground window: with MRU ordering
-        off, ``apps[0]`` is whatever Windows enumerated first, which would make
-        Alt+` cycle a random app's windows.
+        A single tap has to land on the window you came from, and that is a
+        statement about an hwnd rather than about a position: if the app you came
+        from is pinned it sits in the lane, and then MRU slice 0 is *already* the
+        window before it, so advancing again would skip one.
         """
+        if len(shown) <= 1:
+            return 0
+        if reverse:
+            return (mru_count - 1) if mru_count else len(shown) - 1
+
         current = foreground_hwnd()
-        reference = next((a for a in apps if a.hwnd == current), apps[0])
-        key = reference.exe_path or reference.class_name
-        peers = [a for a in apps if (a.exe_path or a.class_name) == key]
-        if len(peers) < 2:
-            return apps
-        peers.sort(key=lambda a: a.hwnd != reference.hwnd)
-        return peers
+        here = next(
+            (
+                i
+                for i, a in enumerate(shown)
+                if a.hwnd == current or (current and current in a.peer_hwnds)
+            ),
+            -1,
+        )
+        if same_app:
+            return max(0, here)  # its own slice; the fan opens on the next window
+        if here < 0:
+            return 0
+        if here >= mru_count:
+            return 0 if mru_count else (here + 1) % len(shown)
+        return (here + 1) % mru_count if mru_count > 1 else here
 
     def commit(self) -> None:
         with self._lock:
@@ -308,9 +329,45 @@ class FunTabApp:
                 return
             app = self.overlay.selected_app()
             self.overlay.hide()
-        if app is not None:
+        if app is None:
+            return
+        if app.hwnd:
             activate_window(app.hwnd)
             self.tracker.note(app.hwnd)
+            return
+        # No hwnd means a pinned slot whose app is closed, or the "new window"
+        # entry at the end of a fan. Launching a closed app is just the case
+        # where that fan has one entry, so there is no separate launch path.
+        self._launch(app)
+
+    def _launch(self, app) -> None:
+        target = app.launch or launch_target(app)
+        self._launch_from = foreground_hwnd()
+        if not launch_app(target, app.exe_path):
+            name = app.app_name or app.exe_name or "that app"
+            w.message_box(
+                f"Fun Tab could not start {name}.\n\n"
+                "Set a \"launch\" path for its slot in config.json if the app "
+                "moved or is installed somewhere unusual.",
+                flags=w.MB_OK | w.MB_ICONWARNING,
+            )
+            return
+        self._launch_at = time.perf_counter()
+        self.overlay.show_launching(app)
+
+    def _note_foreground(self, hwnd: int) -> None:
+        """Dismiss the launching card once something else takes the foreground.
+
+        Driven by the real ``EVENT_SYSTEM_FOREGROUND`` rather than a timer, so
+        the card is up for exactly as long as the start-up actually takes.
+        """
+        if self.overlay.launching is None:
+            return
+        if time.perf_counter() - self._launch_at < 0.15:
+            return  # the launch's own shell activity, not the app arriving
+        if hwnd == self._launch_from or hwnd in self.overlay.own_hwnds():
+            return
+        self.overlay.hide_launching()
 
     def cancel(self) -> None:
         with self._lock:
@@ -378,8 +435,8 @@ class FunTabApp:
 
     def _close_selected(self) -> None:
         app = self.overlay.selected_app()
-        if app is None:
-            return
+        if app is None or not app.hwnd:
+            return  # a closed pin, or "new window": nothing open to close
         if self.cfg.close_confirm and not self._close_confirmed_session:
             title = app.label(title_privacy=self.cfg.title_privacy)
             question = (
@@ -406,7 +463,7 @@ class FunTabApp:
         self._config_stamp = _config_stamp()
 
     def _hide_selected_app(self) -> None:
-        app = self.overlay.selected_app()
+        app = self.overlay.selected_slice()
         if app is None or not app.exe_name:
             return
         name = app.exe_name.lower()
@@ -417,16 +474,38 @@ class FunTabApp:
         self.overlay.drop_exe(name)
 
     def _toggle_pin_selected(self) -> None:
-        app = self.overlay.selected_app()
-        if app is None or not app.exe_name:
+        """Give the aimed app a lane slot, or take its slot away.
+
+        The launch identity is recorded now, while the app is running and can be
+        asked what it is. Resolving it later would mean resolving it from a
+        closed app, which is the one situation where there is nothing to ask.
+        """
+        app = self.overlay.selected_slice()
+        if app is None or not (app.exe_name or app.aumid):
             return
         name = app.exe_name.lower()
-        pinned = list(self.cfg.pinned_exes)
-        if name in pinned:
-            pinned = [item for item in pinned if item != name]
+        slots = [dict(slot) for slot in self.cfg.slots]
+        matched = [
+            slot
+            for slot in slots
+            if (slot.get("exe") or "").lower() == name
+            or (app.aumid and (slot.get("aumid") or "") == app.aumid)
+        ]
+        if matched:
+            slots = [slot for slot in slots if slot not in matched]
         else:
-            pinned.append(name)
-        self.cfg.pinned_exes = pinned
+            slot = {"index": len(slots)}
+            if name:
+                slot["exe"] = name
+            if app.aumid:
+                slot["aumid"] = app.aumid
+            launch = app.launch or launch_target(app)
+            if launch:
+                slot["launch"] = launch
+            if app.app_name:
+                slot["label"] = app.app_name
+            slots.append(slot)
+        self.cfg.slots = slots
         self.cfg.clamp()
         self._persist_config()
         hwnd = app.hwnd
@@ -435,15 +514,14 @@ class FunTabApp:
 
     def _slice_menu(self) -> None:
         """Right-click on a slice: hide, pin, close, minimise."""
-        app = self.overlay.selected_app()
+        app = self.overlay.selected_slice()
         if app is None or not self.overlay.hwnd:
             return
         menu = w.user32.CreatePopupMenu()
         if not menu:
             return
         hide_id, pin_id, close_id, min_id, dismiss_id = 1, 2, 3, 4, 5
-        pinned = app.exe_name.lower() in self.cfg.pinned_exes
-        pin_label = "Unpin this app" if pinned else "Pin this app"
+        pin_label = "Unpin this app" if app.is_pinned else "Pin this app"
         self._menu_open = True
         try:
             w.user32.AppendMenuW(menu, w.MF_STRING, hide_id, "Hide this app")
@@ -567,6 +645,13 @@ class FunTabApp:
                 else:
                     self.overlay.pump_idle()
             else:
+                if (
+                    self.overlay.launching is not None
+                    and time.perf_counter() - self._launch_at > LAUNCH_TIMEOUT
+                ):
+                    # The foreground event is the normal way out; this only
+                    # catches an app that started without ever taking focus.
+                    self.overlay.hide_launching()
                 self._refresh_compat()
 
         self.hook.uninstall()

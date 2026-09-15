@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import shutil
 import threading
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
@@ -34,6 +35,7 @@ _icon_by_hwnd: dict[int, Optional[Image.Image]] = {}
 _icon_by_exe: dict[str, Optional[Image.Image]] = {}
 _appname_by_exe: dict[str, str] = {}
 _exe_by_pid: dict[int, str] = {}
+_aumid_by_hwnd: dict[int, str] = {}
 
 
 @dataclass
@@ -47,9 +49,30 @@ class AppWindow:
     app_name: str = ""
     minimized: bool = False
     maximized: bool = False
+    # The taskbar's own grouping identity. Empty for most plain Win32 apps.
+    aumid: str = ""
+    # Position in the Z-order EnumWindows handed us. Stable while a window
+    # lives, unlike MRU rank, so `` ` `` can cycle an app's windows in an order
+    # that does not rearrange underneath the user as they cycle it.
+    z_index: int = 0
     # When the wheel is grouped, the face window carries how many peers it stands for.
     group_count: int = 1
     peer_hwnds: tuple[int, ...] = ()
+    # --- pinned lane -----------------------------------------------------
+    # Lane entries are *declared* by config rather than discovered by
+    # enumeration, which is what lets a slot survive closing the app.
+    slot: int = -1
+    launch: str = ""
+    running: bool = True
+
+    @property
+    def is_pinned(self) -> bool:
+        return self.slot >= 0
+
+    @property
+    def is_dead(self) -> bool:
+        """A pinned slot whose app is not running: selecting it launches."""
+        return self.slot >= 0 and not self.running
 
     @property
     def exe_name(self) -> str:
@@ -331,6 +354,20 @@ def prune_icon_cache(live_hwnds: Iterable[int]) -> None:
     with _icon_lock:
         for hwnd in [h for h in _icon_by_hwnd if h not in live]:
             _icon_by_hwnd.pop(hwnd, None)
+        for hwnd in [h for h in _aumid_by_hwnd if h not in live]:
+            _aumid_by_hwnd.pop(hwnd, None)
+
+
+def _app_id(hwnd: int) -> str:
+    """Cached AppUserModelID. One COM call per window, once per window's life."""
+    with _icon_lock:
+        cached = _aumid_by_hwnd.get(hwnd)
+    if cached is not None:
+        return cached
+    value = w.window_app_id(hwnd)
+    with _icon_lock:
+        _aumid_by_hwnd[hwnd] = value
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +480,7 @@ def enumerate_windows(
     w.user32.EnumWindows(enum_proc, 0)
 
     result: list[AppWindow] = []
-    for hwnd in hwnds:
+    for z_index, hwnd in enumerate(hwnds):
         pid = wintypes.DWORD()
         w.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         exe_path = _exe_for_pid(int(pid.value))
@@ -465,6 +502,8 @@ def enumerate_windows(
                 app_name=_file_description(exe_path),
                 minimized=bool(w.user32.IsIconic(hwnd)),
                 maximized=bool(w.user32.IsZoomed(hwnd)),
+                aumid=_app_id(hwnd),
+                z_index=z_index,
             )
         )
 
@@ -500,35 +539,29 @@ def order_windows(
 
 
 def group_key(app: AppWindow) -> str:
-    """Identity used to collapse windows of the same application."""
+    """Identity used to collapse windows of the same application.
+
+    AppUserModelID first, because that is what the taskbar groups by. Keying on
+    the executable alone collapses every Chrome profile, every installed PWA and
+    every Electron app sharing a runtime into a single slice, which is not what
+    the user sees anywhere else on their desktop. Most plain Win32 apps declare
+    no AUMID, and those fall back to exactly the old behaviour.
+    """
+    if app.aumid:
+        return f"aumid:{app.aumid.lower()}"
     if app.exe_path:
         return os.path.normcase(app.exe_path)
     return f"class:{app.class_name}"
 
 
-def pin_windows(
-    apps: list[AppWindow], pinned_exes: Iterable[str] = ()
-) -> list[AppWindow]:
-    """Keep the current (first) window, then pinned apps, then the rest."""
-    if not apps:
-        return []
-    rank = {name.lower(): index for index, name in enumerate(pinned_exes) if name}
-    if not rank:
-        return list(apps)
-    first, rest = apps[0], list(apps[1:])
-    pinned = [app for app in rest if app.exe_name.lower() in rank]
-    unpinned = [app for app in rest if app.exe_name.lower() not in rank]
-    pinned.sort(key=lambda app: rank[app.exe_name.lower()])
-    return [first, *pinned, *unpinned]
-
-
-def group_windows(
-    apps: list[AppWindow], pinned_exes: Iterable[str] = ()
-) -> list[AppWindow]:
+def group_windows(apps: list[AppWindow]) -> list[AppWindow]:
     """One face window per application, in the incoming order of first seen.
 
     The face is the most-recent window of that app (first in ``apps`` for that
-    key). `` ` `` later rotates which window is the face.
+    key), so the wheel opens on the window you would expect. ``peer_hwnds`` is
+    ordered by Z-order instead, because that is what the sub-ring fans out and
+    a fan whose entries reshuffle as you step through them cannot be stepped
+    through reliably.
     """
     buckets: dict[str, list[AppWindow]] = {}
     order: list[str] = []
@@ -543,30 +576,164 @@ def group_windows(
     for key in order:
         peers = buckets[key]
         face = peers[0]
-        hwnds = tuple(peer.hwnd for peer in peers)
+        hwnds = tuple(peer.hwnd for peer in sorted(peers, key=lambda p: p.z_index))
         faces.append(replace(face, group_count=len(peers), peer_hwnds=hwnds))
-    return pin_windows(faces, pinned_exes)
+    return faces
+
+
+# ---------------------------------------------------------------------------
+# The pinned lane
+# ---------------------------------------------------------------------------
+
+
+def slot_matches(app: AppWindow, slot: dict) -> bool:
+    """Whether a live window belongs to a configured slot.
+
+    AUMID is checked first for the same reason ``group_key`` prefers it, and
+    the executable name is accepted as well so a slot written by hand (or
+    migrated from ``pinned_exes``) still finds its app.
+    """
+    aumid = str(slot.get("aumid") or "").strip().lower()
+    if aumid and app.aumid and app.aumid.lower() == aumid:
+        return True
+    exe = str(slot.get("exe") or "").strip().lower()
+    return bool(exe) and app.exe_name.lower() == exe
+
+
+def _dead_slot(slot: dict, index: int) -> AppWindow:
+    """A lane entry for an app that is not running.
+
+    Built entirely from config: nothing here ever asked Windows whether the app
+    exists, which is precisely why the slot keeps its position when it closes.
+    """
+    exe = str(slot.get("exe") or "").strip()
+    label = str(slot.get("label") or "").strip()
+    if not label:
+        label = os.path.splitext(os.path.basename(exe))[0].title() if exe else "Empty slot"
+    return AppWindow(
+        hwnd=0,
+        title=label,
+        class_name="",
+        pid=0,
+        # Straight off the executable on disk, because there is no window to ask.
+        # A slot the user cannot recognise is not worth reserving an angle for.
+        icon=_slot_icon(exe),
+        exe_path=exe,
+        app_name=label,
+        aumid=str(slot.get("aumid") or "").strip(),
+        slot=index,
+        launch=str(slot.get("launch") or "").strip() or exe,
+        running=False,
+    )
+
+
+def _slot_icon(exe: str) -> Optional[Image.Image]:
+    """Icon for a closed app, resolved from the executable and cached by path."""
+    if not exe:
+        return _placeholder_icon()
+    with _icon_lock:
+        cached = _icon_by_exe.get(exe)
+    if cached is not None:
+        return cached
+    icon = _icon_from_exe(exe) or _resolve_exe_icon(exe) or _placeholder_icon()
+    with _icon_lock:
+        _icon_by_exe.setdefault(exe, icon)
+    return icon
+
+
+def _resolve_exe_icon(exe: str) -> Optional[Image.Image]:
+    """Find a bare ``name.exe`` on PATH so a hand-written slot still gets an icon."""
+    if os.path.dirname(exe):
+        return None
+    found = shutil.which(exe)
+    return _icon_from_exe(found) if found else None
+
+
+def assign_slots(
+    apps: list[AppWindow], slots: Iterable[dict] = ()
+) -> tuple[list[AppWindow], list[AppWindow]]:
+    """Split the wheel into the fixed pinned lane and the elastic MRU list.
+
+    Replaces the old ``pin_windows`` reordering. Reordering could only ever move
+    something already running; a lane entry has to exist whether or not its app
+    does, so the two sources are merged here rather than one being sorted.
+
+    A pinned app that *is* running leaves the MRU list, so the arc cost is only
+    paid for slots whose app is closed.
+    """
+    ordered = sorted(
+        (s for s in slots if isinstance(s, dict)),
+        key=lambda s: int(s.get("index", 0)),
+    )
+    lane: list[AppWindow] = []
+    claimed: set[int] = set()
+    for position, slot in enumerate(ordered):
+        live = next(
+            (a for a in apps if a.hwnd not in claimed and slot_matches(a, slot)), None
+        )
+        if live is None:
+            lane.append(_dead_slot(slot, position))
+            continue
+        claimed.add(live.hwnd)
+        claimed.update(live.peer_hwnds)
+        launch = str(slot.get("launch") or "").strip() or launch_target(live)
+        lane.append(replace(live, slot=position, launch=launch, running=True))
+
+    mru = [a for a in apps if a.hwnd not in claimed]
+    return lane, mru
 
 
 def present_windows(
     apps: list[AppWindow],
     *,
     group_by_app: bool = False,
-    pinned_exes: Iterable[str] = (),
-    expand_app: bool = False,
-) -> list[AppWindow]:
-    """What the wheel should show: grouped, pinned, or every window."""
-    items = list(apps)
-    if expand_app:
-        return items
-    if group_by_app:
-        return group_windows(items, pinned_exes=pinned_exes)
-    return pin_windows(items, pinned_exes)
+    slots: Iterable[dict] = (),
+) -> tuple[list[AppWindow], list[AppWindow]]:
+    """What the wheel should show, as ``(lane, mru)``.
+
+    With no slots configured the lane is empty and the MRU list is everything,
+    which is byte-identical to the wheel before the lane existed.
+    """
+    items = group_windows(list(apps)) if group_by_app else list(apps)
+    return assign_slots(items, slots)
 
 
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
+
+
+# Anything installed here is packaged; its executable is not directly runnable.
+_PACKAGED_MARKER = os.path.normcase(f"{os.sep}windowsapps{os.sep}")
+
+
+def launch_target(app: AppWindow) -> str:
+    """A string ShellExecute can open to start this app fresh.
+
+    Recorded when a pin is created rather than resolved at launch time, so the
+    app does not have to be running for the slot to work.
+
+    The executable wins where there is a usable one, because plenty of desktop
+    apps report an AUMID that is a grouping label rather than a real shell
+    identity (Chrome reports ``Chrome``, which names nothing in AppsFolder).
+    Packaged apps are the other way round: their exe lives under WindowsApps
+    where it cannot be launched, so those go through the shell namespace, the
+    same route the Start menu takes.
+    """
+    exe = app.exe_path or ""
+    packaged = _PACKAGED_MARKER in os.path.normcase(exe)
+    if exe and not packaged and os.path.splitext(exe)[1].lower() == ".exe":
+        return exe
+    if app.aumid:
+        return f"shell:AppsFolder\\{app.aumid}"
+    return exe
+
+
+def launch_app(target: str, fallback: str = "") -> bool:
+    """Start an app that is not running. False if every route Windows refused."""
+    if w.shell_execute(target):
+        return True
+    return bool(fallback) and fallback != target and w.shell_execute(fallback)
 
 
 def activate_window(hwnd: int) -> bool:

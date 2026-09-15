@@ -32,6 +32,8 @@ DEMO_COLORS = [
 
 def _demo_apps(count: int = 7) -> list[AppWindow]:
     apps = []
+    # Two Chrome windows on purpose: without a group of more than one, a render
+    # cannot show the pips or the fan, which are most of what there is to look at.
     names = [
         ("Fun Tab — radial switcher", "Visual Studio Code"),
         ("Inbox (12)", "Google Chrome"),
@@ -39,7 +41,7 @@ def _demo_apps(count: int = 7) -> list[AppWindow]:
         ("Untitled Session", "Ableton Live"),
         ("notes.md", "Obsidian"),
         ("PowerShell", "Windows Terminal"),
-        ("Now Playing", "Spotify"),
+        ("Docs — Google Chrome", "Google Chrome"),
     ]
     for index in range(count):
         icon = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
@@ -58,9 +60,18 @@ def _demo_apps(count: int = 7) -> list[AppWindow]:
                 exe_path=f"C:\\demo\\{app_name}.exe",
                 app_name=app_name,
                 minimized=index == 3,
+                z_index=index,
             )
         )
     return apps
+
+
+# Deliberately naming apps that are *not* in the demo list, so a render shows
+# what a pinned slot looks like when its app is closed.
+DEMO_SLOTS = [
+    {"index": 0, "exe": "spotify.exe", "label": "Spotify"},
+    {"index": 1, "exe": "steam.exe", "label": "Steam"},
+]
 
 
 class ScenePreview:
@@ -111,12 +122,7 @@ class ScenePreview:
             shrink = min(fit[0] / width, fit[1] / height, 1.0)
         out = (max(1, round(width * shrink)), max(1, round(height * shrink)))
 
-        overlay = Overlay(cfg)
-        overlay._apps = list(self.apps)
-        overlay._all_apps = list(self.apps)
-        overlay._selected = max(0, min(self.selected, len(self.apps) - 1))
-        overlay._apply_metrics(self.dpi)
-        overlay._rebuild_layers()
+        overlay = _prepared(cfg, self.apps, self.selected, dpi=self.dpi)
 
         scene = self._backdrop(cfg, out)
 
@@ -141,13 +147,13 @@ class ScenePreview:
             # Aimed down the middle of the selected slice, so the needle agrees
             # with the highlight instead of looking like a stray mark.
             wheel = wheel.copy()
-            overlay._draw_needle(
-                wheel, overlay._layers.layout.slices[overlay._selected].mid
-            )
+            aimed = overlay._layers.layout.slice_for(overlay._selected)
+            if aimed is not None:
+                overlay._draw_needle(wheel, aimed.mid)
         place(wheel, (width - wheel.width) / 2, (height - wheel.height) / 2)
 
-        if cfg.preview_enabled and self.apps:
-            chosen = self.apps[overlay._selected]
+        if cfg.preview_enabled and overlay.apps:
+            chosen = overlay.apps[overlay._selected]
             if self._thumb is not None:
                 overlay._thumbs[chosen.hwnd] = self._thumb
             card = overlay._build_card(chosen, 1.0)
@@ -218,7 +224,9 @@ def demo_scene(*, dpi: int = 96) -> ScenePreview:
     width, height = 1600, 900
     scene = ScenePreview(
         demo_desktop((width, height)),
-        _demo_apps(6),
+        # Seven, not six: the seventh is a second Chrome window, without which
+        # the shot cannot show grouping or the pips.
+        _demo_apps(7),
         dpi=dpi,
         selected=1,
         origin=(width * 3 // 4, height * 2 // 3),
@@ -227,15 +235,36 @@ def demo_scene(*, dpi: int = 96) -> ScenePreview:
     return scene
 
 
-def render(apps: list[AppWindow], cfg: Config, selected: int = 1) -> Image.Image:
+def _prepared(
+    cfg: Config, apps: list[AppWindow], selected: int, *, dpi: int = 96
+) -> Overlay:
+    """An overlay laid out the way a real open would lay it out.
+
+    Presenting through ``_present_apps`` rather than assigning the raw list is
+    what makes grouping and the pinned lane show up in a render at all — the
+    lane is a second source merged in there, not a property of the window list.
+    """
     overlay = Overlay(cfg)
-    overlay._apps = list(apps)
     overlay._all_apps = list(apps)
-    overlay._selected = max(0, min(selected, len(apps) - 1))
-    overlay._apply_metrics(96)
+    overlay._apply_metrics(dpi)
+    overlay._apps = overlay._present_apps()
+    keep = apps[max(0, min(selected, len(apps) - 1))].hwnd if apps else 0
+    overlay._selected = next(
+        (
+            i
+            for i, a in enumerate(overlay._apps)
+            if a.hwnd == keep or keep in a.peer_hwnds
+        ),
+        0,
+    )
     overlay._rebuild_layers()
+    return overlay
+
+
+def render(apps: list[AppWindow], cfg: Config, selected: int = 1) -> Image.Image:
+    overlay = _prepared(cfg, apps, selected)
     wheel = overlay._compose(time.perf_counter())
-    card = overlay._build_card(apps[overlay._selected], 1.0)
+    card = overlay._build_card(overlay.apps[overlay._selected], 1.0)
 
     pad = 40
     width = wheel.width + card.width + pad * 3
@@ -263,6 +292,9 @@ def main() -> int:
         cfg.theme = "light"
     if "--dark" in args:
         cfg.theme = "dark"
+    if "--pins" in args or "--scene" in args:
+        cfg.slots = [dict(slot) for slot in DEMO_SLOTS]
+        cfg.clamp()
 
     out = Path(__file__).resolve().parent.parent / "preview_wheel.png"
     for arg in sys.argv[1:]:
