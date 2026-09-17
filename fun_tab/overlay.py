@@ -319,9 +319,11 @@ class Overlay:
 
         self._visible = False
         self._sticky = False
-        # `_apps` is a flat list: MRU slices first, then the pinned lane. Every
-        # index-based path — Tab, the digit jumps, the label and hub caches —
-        # therefore needs no idea the lane exists.
+        # `_apps` is a flat list: MRU slices first, then the pinned lane. Digit
+        # jumps, labels and hub caches can treat that as one index space. Tab
+        # and the mouse wheel walk clockwise around the painted wheel instead,
+        # so a pin at six o'clock is on the way around rather than a jump at
+        # the end of the list.
         self._apps: list[AppWindow] = []
         self._all_apps: list[AppWindow] = []
         self._lane_count = 0
@@ -1020,12 +1022,19 @@ class Overlay:
     def cycle(self, delta: int) -> None:
         if not self._apps:
             return
-        count = len(self._apps)
+        order = self._ring_for(*self._counts()).clockwise_indices()
+        if not order:
+            return
+        try:
+            pos = order.index(self._selected)
+        except ValueError:
+            pos = min(self._selected, len(order) - 1)
+        count = len(order)
         if self.cfg.wrap_navigation:
-            index = (self._selected + delta) % count
+            pos = (pos + delta) % count
         else:
-            index = max(0, min(self._selected + delta, count - 1))
-        self.select(index)
+            pos = max(0, min(pos + delta, count - 1))
+        self.select(order[pos])
 
     def jump(self, number: int) -> bool:
         """1-9 pick a slice directly; 0 means the tenth."""
@@ -1980,6 +1989,7 @@ class Overlay:
             tuple(a.title for a in self._apps),
             tuple(a.slot for a in self._apps),
             tuple(a.group_count for a in self._apps),
+            tuple(id(a.icon) if a.icon is not None else 0 for a in self._apps),
             self._lane_count,
             bool(self._query),
             self._query,
@@ -2424,19 +2434,22 @@ class Overlay:
 
     def _hint_for(self, app: AppWindow, fan_entry: Optional[AppWindow]) -> str:
         """The bottom line: whichever affordance this slice actually has."""
-        from .hotkey import parse_hotkey
+        from .hotkey import alt_backtick, parse_hotkey, trigger_label
 
         hotkey = parse_hotkey(self.cfg.open_hotkey).label()
+        step = trigger_label(
+            parse_hotkey(self.cfg.same_app_hotkey, fallback=alt_backtick())
+        )
         if fan_entry is not None:
             if fan_entry.hwnd == 0:
                 return f"{hotkey} · launches a new window · Esc cancel"
-            return f"{hotkey} · ` next window · pull back for apps"
+            return f"{hotkey} · {step} next window · pull back for apps"
         if app.is_dead:
             return f"{hotkey} · not running, will launch · Esc cancel"
         if app.group_count > 1 and self.cfg.subring:
             return f"{hotkey} · reach further out for windows · Esc cancel"
         if app.group_count > 1:
-            return f"{hotkey} · ` next window · Esc cancel"
+            return f"{hotkey} · {step} next window · Esc cancel"
         return f"{hotkey} · type to search · Esc cancel"
 
     def _slice_title(self, app: AppWindow) -> str:
@@ -2479,6 +2492,7 @@ class Overlay:
             self._query_matched,
             self.compat_active,
             self.cfg.open_hotkey,
+            self.cfg.same_app_hotkey,
             self.cfg.title_privacy,
             self.cfg.group_by_app,
         )

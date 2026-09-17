@@ -115,11 +115,20 @@ class Hotkey:
         return " + ".join(parts)
 
 
-def parse_hotkey(text: str | None) -> Hotkey:
-    """Turn a config string into a Hotkey. Bad input becomes Alt+Tab."""
+def alt_tab() -> Hotkey:
+    return Hotkey(alt=True, kind="key", code=w.VK_TAB)
+
+
+def alt_backtick() -> Hotkey:
+    return Hotkey(alt=True, kind="key", code=w.VK_OEM_3)
+
+
+def parse_hotkey(text: str | None, *, fallback: Hotkey | None = None) -> Hotkey:
+    """Turn a config string into a Hotkey. Bad input becomes Alt+Tab (or `fallback`)."""
+    default = fallback if fallback is not None else alt_tab()
     raw = (text or "").strip().lower().replace(" ", "")
     if not raw:
-        return Hotkey(alt=True, kind="key", code=w.VK_TAB)
+        return default
 
     parts = [p for p in raw.split("+") if p]
     ctrl = alt = shift = win = False
@@ -137,7 +146,7 @@ def parse_hotkey(text: str | None) -> Hotkey:
             trigger = part
 
     if trigger is None:
-        return Hotkey(alt=True, kind="key", code=w.VK_TAB)
+        return default
 
     if trigger in _MOUSE_NAMES:
         return Hotkey(
@@ -151,8 +160,20 @@ def parse_hotkey(text: str | None) -> Hotkey:
 
     vk = _KEY_NAMES.get(trigger)
     if vk is None:
-        return Hotkey(alt=True, kind="key", code=w.VK_TAB)
+        return default
     return Hotkey(ctrl=ctrl, alt=alt, shift=shift, win=win, kind="key", code=vk)
+
+
+def trigger_label(hotkey: Hotkey) -> str:
+    """Just the key or mouse button, for in-wheel hints like '` next window'."""
+    if hotkey.kind == "mouse":
+        return {MOUSE4: "Mouse 4", MOUSE5: "Mouse 5"}.get(hotkey.code, "Mouse")
+    if hotkey.code == w.VK_OEM_3:
+        return "`"
+    name = _VK_TO_NAME.get(hotkey.code, "")
+    if not name:
+        return "key"
+    return name.upper() if len(name) == 1 else name.title()
 
 
 def modifiers_match(

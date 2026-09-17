@@ -25,6 +25,11 @@ def config_dir() -> Path:
     return Path(base) / "fun-tab"
 
 
+def icon_dir() -> Path:
+    """Where pinned-app logos are stocked so a closed pin still has a face."""
+    return config_dir() / "icons"
+
+
 def config_path() -> Path:
     return config_dir() / "config.json"
 
@@ -178,6 +183,9 @@ class Config:
     # mouse side-buttons (`mouse4`, `ctrl+mouse5`). Game-compat leaves plain
     # Alt+Tab to Windows; set a custom chord or mouse button for those games.
     open_hotkey: str = "alt+tab"
+    # Open already fanned out on the current app. While the wheel is open, the
+    # same trigger key steps through that app's windows. Default is Alt+`.
+    same_app_hotkey: str = "alt+backtick"
     # When True, the wheel stays up after the open shortcut is released.
     # When False, releasing Alt (or the mouse button / key) commits, like Alt+Tab.
     open_sticky: bool = False
@@ -282,9 +290,12 @@ class Config:
             self.game_compat = "auto"
         if self.title_privacy not in ("full", "app"):
             self.title_privacy = "full"
-        from .hotkey import parse_hotkey
+        from .hotkey import alt_backtick, parse_hotkey
 
         self.open_hotkey = parse_hotkey(self.open_hotkey).text()
+        self.same_app_hotkey = parse_hotkey(
+            self.same_app_hotkey, fallback=alt_backtick()
+        ).text()
         if self.privacy_mode:
             apply_privacy_bundle(self)
         self.pin_slot_degrees = _clampf(self.pin_slot_degrees, 8.0, 90.0)
@@ -585,6 +596,7 @@ __all__ = [
     "alpha",
     "config_dir",
     "config_path",
+    "icon_dir",
     "mix",
     "CONSENT_VERSION",
 ]

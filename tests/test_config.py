@@ -127,6 +127,7 @@ def test_a_config_from_before_the_aiming_options_keeps_them_on(tmp_path):
     cfg = Config.load(path)
     assert cfg.aim_needle is True
     assert cfg.aim_origin is True
+    assert cfg.same_app_hotkey == "alt+backtick"
 
 
 def test_group_by_app_is_on_by_default():
@@ -139,6 +140,16 @@ def test_exe_lists_are_normalised_on_clamp():
     cfg.clamp()
     assert cfg.exclude_exes == ["chrome.exe", "slack.exe"]
     assert cfg.pinned_exes == ["spotify.exe"], "a hidden app cannot also be pinned"
+
+
+def test_same_app_hotkey_defaults_to_alt_backtick():
+    assert Config().same_app_hotkey == "alt+backtick"
+
+
+def test_garbage_same_app_hotkey_falls_back_to_alt_backtick():
+    cfg = Config(same_app_hotkey="not-a-chord")
+    cfg.clamp()
+    assert cfg.same_app_hotkey == "alt+backtick"
 
 
 # -- colour helpers ---------------------------------------------------------

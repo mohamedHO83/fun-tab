@@ -266,3 +266,90 @@ def test_launch_target_uses_the_shell_namespace_for_packaged_apps():
         aumid="WhatsAppDesktop!App",
     )
     assert launch_target(packaged) == "shell:AppsFolder\\WhatsAppDesktop!App"
+
+
+def test_a_closed_pin_keeps_the_recorded_launch_path():
+    from fun_tab.windows_enum import assign_slots
+
+    lane, _ = assign_slots(
+        [],
+        [
+            {
+                "index": 0,
+                "exe": "spotify.exe",
+                "launch": r"C:\Spotify\Spotify.exe",
+                "label": "Spotify",
+            }
+        ],
+    )
+    assert lane[0].is_dead is True
+    assert lane[0].launch == r"C:\Spotify\Spotify.exe"
+
+
+def test_a_stocked_icon_is_used_for_a_closed_pin(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from fun_tab import windows_enum as we
+    from fun_tab.windows_enum import assign_slots, stock_icon
+
+    monkeypatch.setattr("fun_tab.config.icon_dir", lambda: tmp_path)
+    logo = Image.new("RGBA", (32, 32), (20, 180, 80, 255))
+    stock_icon("spotify.exe", logo)
+    we._icon_by_exe.clear()
+
+    lane, _ = assign_slots(
+        [], [{"index": 0, "exe": "spotify.exe", "label": "Spotify"}]
+    )
+    assert lane[0].icon is not None
+    assert lane[0].icon.getpixel((16, 16))[:3] == (20, 180, 80)
+
+
+def test_a_running_pin_restocks_its_icon(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from fun_tab.windows_enum import assign_slots, load_stocked_icon
+
+    monkeypatch.setattr("fun_tab.config.icon_dir", lambda: tmp_path)
+    logo = Image.new("RGBA", (32, 32), (200, 40, 40, 255))
+    live = win(2, "Now Playing", "spotify.exe")
+    live.icon = logo
+    assign_slots([live], [{"index": 0, "exe": "spotify.exe"}])
+    stocked = load_stocked_icon("spotify.exe")
+    assert stocked is not None
+    assert stocked.getpixel((16, 16))[:3] == (200, 40, 40)
+
+
+def test_slot_from_path_records_the_full_exe(tmp_path, monkeypatch):
+    from fun_tab.windows_enum import slot_from_path
+
+    monkeypatch.setattr("fun_tab.config.icon_dir", lambda: tmp_path / "icons")
+    exe = tmp_path / "Spotify.exe"
+    exe.write_bytes(b"")
+    slot = slot_from_path(str(exe))
+    assert slot is not None
+    assert slot["exe"] == "spotify.exe"
+    assert slot["launch"] == str(exe)
+    assert slot["label"] == "Spotify"
+
+
+def test_slot_from_path_rejects_missing_and_non_app_files(tmp_path):
+    from fun_tab.windows_enum import slot_from_path
+
+    missing = tmp_path / "nope.exe"
+    other = tmp_path / "notes.txt"
+    other.write_text("hi", encoding="utf-8")
+    assert slot_from_path(str(missing)) is None
+    assert slot_from_path(str(other)) is None
+
+
+def test_a_shortcut_pin_still_launches_the_lnk_itself(tmp_path, monkeypatch):
+    """Arguments and working directory live on the shortcut, not the target."""
+    from fun_tab.windows_enum import slot_from_path
+
+    monkeypatch.setattr("fun_tab.config.icon_dir", lambda: tmp_path / "icons")
+    shortcut = tmp_path / "Chrome.lnk"
+    shortcut.write_bytes(b"")
+    slot = slot_from_path(str(shortcut))
+    assert slot is not None
+    assert slot["launch"] == str(shortcut)
+    assert slot["exe"] == "chrome.exe"

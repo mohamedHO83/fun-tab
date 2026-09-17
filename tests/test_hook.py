@@ -246,7 +246,28 @@ def test_alt_backtick_opens_the_current_app_only():
     kb = Keyboard()
     kb.alt = True
     assert kb.press(w.VK_OEM_3) is True
-    assert kb.actions() == [(hook_mod.OPEN, {"same_app": True, "reverse": False})]
+    assert kb.actions() == [
+        (hook_mod.OPEN, {"same_app": True, "sticky": False, "reverse": False})
+    ]
+
+
+def test_same_app_hotkey_can_be_remapped():
+    kb = Keyboard()
+    kb.hook.set_same_app_hotkey("alt+q")
+    kb.alt = True
+    assert kb.press(ord("Q")) is True
+    assert kb.actions() == [
+        (hook_mod.OPEN, {"same_app": True, "sticky": False, "reverse": False})
+    ]
+    assert kb.press(w.VK_OEM_3) is False
+    assert kb.kinds() == []
+
+
+def test_in_wheel_same_app_uses_the_configured_key():
+    kb = Keyboard(opened=True)
+    kb.hook.set_same_app_hotkey("alt+q")
+    assert kb.press(ord("Q")) is True
+    assert kb.actions() == [(hook_mod.SAME_APP, 1)]
 
 
 def test_alt_down_is_learned_from_the_event_flag():

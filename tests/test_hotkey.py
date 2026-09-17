@@ -7,9 +7,11 @@ from fun_tab.hotkey import (
     MOUSE4,
     MOUSE5,
     Hotkey,
+    alt_backtick,
     is_classic_alt_tab,
     modifiers_match,
     parse_hotkey,
+    trigger_label,
 )
 
 
@@ -27,7 +29,7 @@ def test_mouse_side_buttons_parse():
 
 
 def test_round_trip_keeps_the_chord():
-    for text in ("alt+tab", "ctrl+alt+tab", "mouse4", "shift+mouse5", "ctrl+shift+a"):
+    for text in ("alt+tab", "alt+backtick", "ctrl+alt+tab", "mouse4", "shift+mouse5", "ctrl+shift+a"):
         assert parse_hotkey(text).text() == parse_hotkey(parse_hotkey(text).text()).text()
 
 
@@ -52,3 +54,18 @@ def test_modifiers_match_requires_what_the_chord_asks_for():
 def test_classic_alt_tab_still_allows_ctrl_for_sticky():
     hk = parse_hotkey("alt+tab")
     assert modifiers_match(hk, ctrl=True, alt=True, shift=False)
+
+
+def test_alt_backtick_round_trips():
+    hk = parse_hotkey("alt+backtick")
+    assert hk == alt_backtick()
+    assert parse_hotkey(hk.text()) == hk
+
+
+def test_unknown_same_app_chord_falls_back_to_alt_backtick():
+    assert parse_hotkey("not-a-key", fallback=alt_backtick()) == alt_backtick()
+
+
+def test_trigger_label_is_the_key_itself():
+    assert trigger_label(alt_backtick()) == "`"
+    assert trigger_label(parse_hotkey("alt+q")) == "Q"

@@ -132,6 +132,35 @@ def test_single_app_cycle_stays_put():
     assert o.selected_index == 0
 
 
+def test_cycle_follows_the_wheel_when_an_app_is_pinned():
+    """Opera GX in the lane sits at six o'clock. Tab has to pass through it
+    rather than jumping from one side of the free arc to the other.
+    """
+    apps = [
+        app(1, "notes.md", "obsidian.exe"),
+        app(2, "Inbox", "chrome.exe"),
+        app(3, "standup", "slack.exe"),
+        app(4, "Now Playing", "spotify.exe"),
+        app(5, "GX", "opera.exe"),
+    ]
+    o = wheel(apps, selected=0, pin_lane=True)
+    o.cfg.set_slot_order(["opera.exe"])
+    o._apps = o._present_apps()
+    o._selected = 0
+    seen = [0]
+    for _ in range(len(o.apps) - 1):
+        o.cycle(1)
+        seen.append(o.selected_index)
+    ring = o._ring_for(*o._counts())
+    assert tuple(seen) == ring.clockwise_indices()
+    pin = next(i for i, a in enumerate(o.apps) if a.exe_name.lower() == "opera.exe")
+    assert o.apps[pin].is_pinned
+    order = list(ring.clockwise_indices())
+    o._selected = order[order.index(pin) - 1]
+    o.cycle(1)
+    assert o.selected_index == pin
+
+
 # -- same-app cycling ------------------------------------------------------
 
 

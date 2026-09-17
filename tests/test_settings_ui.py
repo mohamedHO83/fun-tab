@@ -132,6 +132,27 @@ def test_group_by_app_is_offered_on_the_windows_tab():
     assert setting.group == "Windows"
 
 
+def test_the_same_app_shortcut_is_offered_next_to_open():
+    keys = {s.key: s for s in SETTINGS}
+    assert keys["same_app_hotkey"].kind == "hotkey"
+    assert keys["same_app_hotkey"].group == "Windows"
+    assert keys["same_app_hotkey"].section == keys["open_hotkey"].section
+
+
+def test_windows_controls_are_grouped_under_headings():
+    """The Windows tab used to be a single packed list; headings keep it scannable."""
+    windows = [s for s in SETTINGS if s.group == "Windows"]
+    assert all(s.section for s in windows)
+    assert len({s.section for s in windows}) >= 4
+    seen: list[str] = []
+    for setting in windows:
+        if not seen or seen[-1] != setting.section:
+            seen.append(setting.section)
+    assert seen == list(dict.fromkeys(s.section for s in windows)), (
+        "a heading must not come back later in the same tab"
+    )
+
+
 @pytest.mark.parametrize(
     "percent_of, value, expected",
     [(1.0, 1.0, "100%"), (1.0, 0.5, "50%"), (200.0, 40, "20%"), (None, 1.5, "1.5")],

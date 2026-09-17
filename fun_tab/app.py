@@ -24,6 +24,7 @@ from .windows_enum import (
     launch_target,
     minimize_window,
     present_windows,
+    stock_icon,
 )
 
 # How long the launching card waits for the new window before giving up. Long
@@ -123,6 +124,7 @@ class FunTabApp:
         self.hook.digit_jump = self.cfg.digit_jump
         self.hook.close_key_enabled = self.cfg.close_key_enabled
         self.hook.set_open_hotkey(self.cfg.open_hotkey)
+        self.hook.set_same_app_hotkey(self.cfg.same_app_hotkey)
         self.hook.open_sticky = bool(self.cfg.open_sticky)
         self._refresh_compat()
 
@@ -504,6 +506,8 @@ class FunTabApp:
                 slot["launch"] = launch
             if app.app_name:
                 slot["label"] = app.app_name
+            if name and app.icon is not None:
+                stock_icon(name, app.icon)
             slots.append(slot)
         self.cfg.slots = slots
         self.cfg.clamp()

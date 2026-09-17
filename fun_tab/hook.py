@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from . import win32_types as w
-from .hotkey import Hotkey, is_classic_alt_tab, modifiers_match, parse_hotkey
+from .hotkey import Hotkey, alt_backtick, is_classic_alt_tab, modifiers_match, parse_hotkey
 
 # Action kinds emitted to the UI thread.
 OPEN = "open"
@@ -65,6 +65,7 @@ class AltTabHook:
         # When True, leave native Alt+Tab alone (game compatibility).
         self.compat_active = False
         self.open_hotkey: Hotkey = parse_hotkey("alt+tab")
+        self.same_app_hotkey: Hotkey = alt_backtick()
         self.open_sticky = False
         # What must stay held for a non-sticky open (classic Alt+Tab style).
         # "alt" / "mods" / "key" / "mouse" / None (sticky or closed).
@@ -80,6 +81,9 @@ class AltTabHook:
 
     def set_open_hotkey(self, text: str) -> None:
         self.open_hotkey = parse_hotkey(text)
+
+    def set_same_app_hotkey(self, text: str) -> None:
+        self.same_app_hotkey = parse_hotkey(text, fallback=alt_backtick())
 
     def _want_sticky(self, *, force: bool = False) -> bool:
         if force or self.open_sticky:
@@ -274,6 +278,28 @@ class AltTabHook:
             return False  # navigation stays on the wheel / keyboard
 
         if hotkey.kind != "mouse" or hotkey.code != button:
+            same = self.same_app_hotkey
+            if (
+                same.kind == "mouse"
+                and same.code == button
+                and modifiers_match(same, **self._mods())
+                and not (self.compat_active and same.alt)
+            ):
+                sticky = self._want_sticky()
+                if sticky:
+                    self._clear_hold()
+                else:
+                    self._arm_hold(same)
+                self._emit(PREPARE)
+                self._emit(
+                    OPEN,
+                    {
+                        "same_app": True,
+                        "sticky": sticky,
+                        "reverse": self._shift_held() and not same.shift,
+                    },
+                )
+                return True
             return False
         if not modifiers_match(hotkey, **self._mods()):
             return False
@@ -349,13 +375,16 @@ class AltTabHook:
 
     def _should_prepare_on_alt(self) -> bool:
         hotkey = self.open_hotkey
-        if hotkey.kind != "key" or not hotkey.alt:
-            return False
-        if self.compat_active and is_classic_alt_tab(hotkey):
-            # Compat leaves Alt+Tab to Windows; only warm if Ctrl is also down
-            # (Ctrl+Alt+Tab style) or the hotkey itself asks for Ctrl.
-            return hotkey.ctrl or self._ctrl_held()
-        return True
+        if hotkey.kind == "key" and hotkey.alt:
+            if self.compat_active and is_classic_alt_tab(hotkey):
+                # Compat leaves Alt+Tab to Windows; only warm if Ctrl is also down
+                # (Ctrl+Alt+Tab style) or the hotkey itself asks for Ctrl.
+                return hotkey.ctrl or self._ctrl_held()
+            return True
+        same = self.same_app_hotkey
+        if same.kind == "key" and same.alt and not self.compat_active:
+            return True
+        return False
 
     # -- wheel closed ------------------------------------------------------
 
@@ -405,18 +434,50 @@ class AltTabHook:
             self._emit(PREPARE)
             return False
 
-        # Same-app Alt+` — only when we are allowed to own Alt chords.
-        if (
-            not self.compat_active
-            and self._alt_held()
-            and vk == w.VK_OEM_3
-            and not (hotkey.kind == "key" and hotkey.code == w.VK_OEM_3)
-        ):
+        # Fan the current app out. Default is Alt+`; remapped in Settings.
+        if self._matches_same_app_open(vk, mods):
+            same = self.same_app_hotkey
+            sticky = self._want_sticky()
+            if sticky:
+                self._clear_hold()
+            else:
+                self._arm_hold(same)
+            if not same.alt:
+                self._emit(PREPARE)
             self._swallowed_tab = True
-            self._emit(OPEN, {"same_app": True, "reverse": self._shift_held()})
+            self._emit(
+                OPEN,
+                {
+                    "same_app": True,
+                    "sticky": sticky,
+                    "reverse": mods["shift"] and not same.shift,
+                },
+            )
             return True
 
         return False
+
+    def _matches_same_app_open(self, vk: int, mods: dict[str, bool]) -> bool:
+        same = self.same_app_hotkey
+        if same.kind != "key" or vk != same.code:
+            return False
+        if not modifiers_match(same, **mods):
+            return False
+        if self.compat_active and same.alt:
+            return False
+        open_hk = self.open_hotkey
+        # The open shortcut already claimed this chord.
+        if (
+            open_hk.kind == "key"
+            and open_hk.code == same.code
+            and modifiers_match(open_hk, **mods)
+        ):
+            steal = True
+            if self.compat_active and is_classic_alt_tab(open_hk):
+                steal = mods["ctrl"]
+            if steal:
+                return False
+        return True
 
     # -- wheel open --------------------------------------------------------
 
@@ -457,7 +518,7 @@ class AltTabHook:
             self._emit(BACKSPACE)
             return True
 
-        if vk == w.VK_OEM_3:
+        if self.same_app_hotkey.kind == "key" and vk == self.same_app_hotkey.code:
             self._emit(SAME_APP, -1 if self._shift_held() else 1)
             return True
 

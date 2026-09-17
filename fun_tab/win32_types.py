@@ -1074,6 +1074,14 @@ shell32.ShellExecuteW.argtypes = [
 shell32.ShellExecuteW.restype = wintypes.HINSTANCE
 ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
 ole32.CoInitializeEx.restype = ctypes.c_long  # not HRESULT: S_FALSE is not an error
+ole32.CoCreateInstance.argtypes = [
+    ctypes.POINTER(GUID),
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(GUID),
+    ctypes.POINTER(ctypes.c_void_p),
+]
+ole32.CoCreateInstance.restype = ctypes.c_long
 ole32.PropVariantClear.argtypes = [ctypes.POINTER(PROPVARIANT)]
 ole32.PropVariantClear.restype = ctypes.c_long
 
@@ -1162,3 +1170,92 @@ def shell_execute(target: str) -> bool:
     except OSError:
         return False
     return int(result or 0) > 32
+
+
+CLSCTX_INPROC_SERVER = 1
+STGM_READ = 0
+# {00021401-0000-0000-C000-000000000046}
+_CLSID_SHELL_LINK = GUID(
+    0x00021401, 0x0000, 0x0000, (ctypes.c_ubyte * 8)(0xC0, 0, 0, 0, 0, 0, 0, 0x46)
+)
+# {000214F9-0000-0000-C000-000000000046}
+_IID_ISHELL_LINK_W = GUID(
+    0x000214F9, 0x0000, 0x0000, (ctypes.c_ubyte * 8)(0xC0, 0, 0, 0, 0, 0, 0, 0x46)
+)
+# {0000010b-0000-0000-C000-000000000046}
+_IID_IPERSIST_FILE = GUID(
+    0x0000010B, 0x0000, 0x0000, (ctypes.c_ubyte * 8)(0xC0, 0, 0, 0, 0, 0, 0, 0x46)
+)
+_QIProto = ctypes.WINFUNCTYPE(
+    ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
+)
+_LoadProto = ctypes.WINFUNCTYPE(
+    ctypes.c_long, ctypes.c_void_p, wintypes.LPCWSTR, wintypes.DWORD
+)
+_GetPathProto = ctypes.WINFUNCTYPE(
+    ctypes.c_long,
+    ctypes.c_void_p,
+    wintypes.LPWSTR,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+)
+
+
+def resolve_shortcut(path: str) -> str:
+    """The target of a .lnk, or "" if it cannot be read.
+
+    Used so a pinned shortcut still matches the running .exe. Launching the
+    .lnk itself is what actually starts the app (arguments and working
+    directory live on the shortcut).
+    """
+    if not path or not ensure_com():
+        return ""
+    link = ctypes.c_void_p()
+    persist = ctypes.c_void_p()
+    hr = int(
+        ole32.CoCreateInstance(
+            ctypes.byref(_CLSID_SHELL_LINK),
+            None,
+            CLSCTX_INPROC_SERVER,
+            ctypes.byref(_IID_ISHELL_LINK_W),
+            ctypes.byref(link),
+        )
+    )
+    if hr != 0 or not link.value:
+        return ""
+    try:
+        vtable = ctypes.cast(
+            link, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        ).contents
+        if _QIProto(vtable[0])(link, ctypes.byref(_IID_IPERSIST_FILE), ctypes.byref(persist)) != 0:
+            return ""
+        if not persist.value:
+            return ""
+        try:
+            ptable = ctypes.cast(
+                persist, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+            ).contents
+            if _LoadProto(ptable[5])(persist, path, STGM_READ) != 0:
+                return ""
+            buf = ctypes.create_unicode_buffer(32768)
+            if _GetPathProto(vtable[3])(link, buf, len(buf), None, 0) != 0:
+                return ""
+            return (buf.value or "").strip()
+        finally:
+            _ReleaseProto(
+                ctypes.cast(
+                    persist, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+                ).contents[_VT_RELEASE]
+            )(persist)
+    except Exception:
+        return ""
+    finally:
+        try:
+            _ReleaseProto(
+                ctypes.cast(
+                    link, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+                ).contents[_VT_RELEASE]
+            )(link)
+        except Exception:
+            pass

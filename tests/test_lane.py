@@ -54,16 +54,18 @@ def test_no_pins_is_byte_identical_to_the_old_wheel(count):
 @pytest.mark.parametrize("pins", [0, 1, 2, 3, 5, 8])
 def test_straight_up_always_picks_the_first_slice(mru, pins):
     """The wheel opens with the cursor at the hub, so 12 o'clock is the one
-    direction the user gets for free. It has to be a slice centre for every
-    count, never the seam between the newest and oldest window.
+    direction the user gets for free. It has to pick slice 0 for every count.
     """
     assert ring(mru, pins).aim(*at(UP)) == 0
 
 
 @pytest.mark.parametrize("mru", range(1, 13))
-def test_the_first_slice_is_centred_on_twelve_oclock(mru):
-    first = ring(mru, 5).mru.slices[0]
-    assert first.mid == pytest.approx(UP, abs=1e-9)
+def test_the_first_slice_owns_twelve_oclock(mru):
+    layout = ring(mru, 5)
+    first = layout.mru.slices[0]
+    assert layout.aim(*at(UP)) == 0
+    if mru % 2:
+        assert first.mid == pytest.approx(UP, abs=1e-9)
 
 
 # -- lane geometry ----------------------------------------------------------
@@ -98,8 +100,10 @@ def test_the_lane_is_centred_on_six_oclock():
 
 
 def test_lane_indices_continue_after_the_mru_ones():
-    """One flat index space, so selection, Tab and the digit jumps stay ignorant
-    of the lane's existence.
+    """One flat index space, so digit jumps stay ignorant of the lane.
+
+    Tab walks clockwise around the painted wheel instead — see
+    ``clockwise_indices``.
     """
     layout = ring(4, 3)
     assert [s.index for s in layout.mru.slices] == [0, 1, 2, 3]
@@ -142,27 +146,20 @@ def test_every_lane_slot_is_reachable_by_aiming_at_it(mru):
         assert layout.aim(*at(geom.mid)) == geom.index
 
 
-def test_an_even_window_count_leaves_one_slot_unfilled():
-    """Rounding the slot count up is what keeps 12 o'clock a slice centre; the
-    spare slot lands beside slice 0, reading as the list's start rather than as a
-    missing tooth.
+def test_an_even_window_count_fills_the_free_arc_exactly():
+    """A spare empty slot used to keep 12 o'clock a slice centre, but it read
+    as a missing tooth that appeared and vanished with the window count.
     """
     layout = ring(6, 4)
-    assert -1 in layout.mru.slot_index
+    assert -1 not in layout.mru.slot_index
     assert len(layout.mru.slices) == 6
-    assert sum(1 for i in layout.mru.slot_index if i >= 0) == 6
+    assert len(layout.bands) == 2, "one MRU band plus the lane"
 
 
 def test_an_odd_window_count_fills_the_free_arc_exactly():
     layout = ring(7, 4)
     assert -1 not in layout.mru.slot_index
     assert len(layout.bands) == 2, "one MRU band plus the lane"
-
-
-def test_the_unfilled_slot_paints_as_a_gap():
-    """It must not get ring fill, or it reads as a slice holding nothing."""
-    layout = ring(6, 4)
-    assert len(layout.bands) == 3, "the free arc is split in two, plus the lane"
 
 
 def test_pins_shrink_the_arc_the_windows_share():
@@ -182,3 +179,39 @@ def test_no_slices_at_all_is_not_an_error():
     layout = ring(0, 0)
     assert layout.count == 0
     assert layout.aim(*at(UP)) is None
+    assert layout.clockwise_indices() == ()
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5, 6, 7, 12])
+def test_without_pins_tab_order_is_still_index_order(count):
+    """The no-pin wheel already laid slices out clockwise from 12 o'clock."""
+    assert ring(count, 0).clockwise_indices() == tuple(range(count))
+
+
+def test_tab_visits_the_pin_instead_of_jumping_across_twelve():
+    """Five MRU windows put slice 0 at 12 o'clock, 1 and 2 clockwise of it,
+    and 3 and 4 the other way. Index-order Tab went 2 → 3, which skips the
+    pin at six o'clock. Clockwise order goes 2 → pin → 3.
+    """
+    layout = ring(5, 1)
+    assert layout.clockwise_indices() == (0, 1, 2, 5, 3, 4)
+    assert layout.is_lane(5)
+
+
+@pytest.mark.parametrize("mru", range(1, 13))
+@pytest.mark.parametrize("pins", [1, 2, 4])
+def test_each_tab_lands_on_a_clockwise_neighbour(mru, pins):
+    """No step may skip over another slice; that is the jump the wheel is for."""
+    layout = ring(mru, pins)
+    order = layout.clockwise_indices()
+    assert sorted(order) == list(range(layout.count))
+    mids = {sl.index: sl.mid for sl in layout.slices}
+    for i, index in enumerate(order):
+        nxt = order[(i + 1) % len(order)]
+        step = (mids[index] - mids[nxt]) % TAU
+        others = [
+            (mids[index] - mids[other]) % TAU
+            for other in order
+            if other != index
+        ]
+        assert step == pytest.approx(min(others), abs=1e-9)

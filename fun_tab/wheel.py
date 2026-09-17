@@ -122,9 +122,10 @@ class WheelLayout:
 class RingLayout:
     """The main ring: an elastic MRU arc plus a fixed pinned lane.
 
-    Slice indices are flat across both, MRU first, so everything that already
-    walks a single list of slices — selection, Tab, the digit jumps, the label
-    and hub caches — keeps working without knowing the lane exists.
+    Slice indices are flat across both, MRU first, so digit jumps, labels and
+    hub caches can ignore the lane. Tab and the mouse wheel do not: they walk
+    clockwise around the painted wheel, otherwise a pin at six o'clock is
+    skipped when the highlight wraps from one side of the free arc to the other.
     """
 
     cx: float
@@ -165,6 +166,24 @@ class RingLayout:
 
     def is_lane(self, index: int) -> bool:
         return index >= self.mru_count
+
+    def clockwise_indices(self) -> tuple[int, ...]:
+        """Slice indices in clockwise order, starting at 12 o'clock.
+
+        Tab and the mouse wheel walk this, not list order. List order is MRU
+        then the lane, and with pins that jumps from the east of the free arc
+        to the west of it, skipping six o'clock — which is the opposite of
+        turning a wheel.
+        """
+        if not self.slices:
+            return ()
+        keyed = [((math.pi / 2 - sl.mid) % TAU, sl.index) for sl in self.slices]
+        keyed.sort()
+        # Slice 0 is centred on 12 o'clock. A mid a hair the other side of
+        # π/2 wraps the sort key to nearly TAU and would put it last.
+        start = min(range(len(keyed)), key=lambda i: min(keyed[i][0], TAU - keyed[i][0]))
+        keyed = keyed[start:] + keyed[:start]
+        return tuple(index for _angle, index in keyed)
 
 
 def _empty_layout(cx: float, cy: float, outer_r: float, inner_r: float) -> WheelLayout:
@@ -339,30 +358,31 @@ def build_wheel(
             bands=_filled_bands(lane),
         )
 
-    # The free arc is symmetric about 12 o'clock, so an odd number of slots puts
-    # one slot's centre exactly there and straight up stays an unambiguous pick.
-    # For an even window count we round the slot count up and leave one slot
-    # unfilled; it lands just counter-clockwise of slice 0, where it reads as
-    # the boundary between the newest and the oldest window rather than as a
-    # missing tooth.
-    slot_count = mru_count if mru_count % 2 else mru_count + 1
-    centre_slot = (slot_count - 1) // 2
-    positions = tuple((centre_slot + i) % slot_count for i in range(mru_count))
-    if slot_count > mru_count:
-        # build_arc_layout sizes the sweep from the highest slot used, so the
-        # unfilled slot has to be accounted for explicitly.
-        positions = positions + ((centre_slot - 1) % slot_count,)
-
-    mru = build_arc_layout(
-        mru_count,
-        cx,
-        cy,
-        outer_r,
-        inner_r,
-        LANE_CENTER - span / 2 - gap,
-        free,
-        slots=positions,
+    # Put slice 0 on 12 o'clock using the same hit test the cursor uses, so
+    # straight up cannot land on a neighbour because of a rounding seam.
+    # Filling every slot (no spare empty tooth) is what stops the hole that
+    # used to appear and vanish with even window counts.
+    first_edge = LANE_CENTER - span / 2 - gap
+    probe = build_arc_layout(
+        mru_count, cx, cy, outer_r, inner_r, first_edge, free
     )
+    mid_r = (inner_r + outer_r) * 0.5
+    hit = probe.aim(cx, cy - mid_r)
+    centre_slot = 0 if hit is None else hit
+    if centre_slot:
+        positions = tuple((centre_slot + i) % mru_count for i in range(mru_count))
+        mru = build_arc_layout(
+            mru_count,
+            cx,
+            cy,
+            outer_r,
+            inner_r,
+            first_edge,
+            free,
+            slots=positions,
+        )
+    else:
+        mru = probe
 
     return RingLayout(
         cx=cx,

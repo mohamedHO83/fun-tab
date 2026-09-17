@@ -21,6 +21,10 @@ from typing import Any
 from .config import Config, config_path
 
 PANEL_W = 560  # preview width at 100% scaling
+# Tall enough to sit beside the preview; the Windows tab scrolls rather than
+# packing every control into a wall of checkboxes.
+TAB_W = 540
+TAB_H = 488
 # The app finds an already-open window by title rather than starting a second.
 WINDOW_TITLE = "Fun Tab settings"
 
@@ -38,6 +42,7 @@ class Setting:
     percent_of: float | None = None  # value that reads as 100%
     hint: str = ""
     invert: bool = False  # if True, slider is displayed inverted (high=good)
+    section: str = ""  # heading inside a tab; empty means no extra heading
 
 
 GROUPS = ("Look", "Background", "Aiming", "Windows", "Privacy")
@@ -124,7 +129,17 @@ SETTINGS: tuple[Setting, ...] = (
         "Open shortcut",
         "hotkey",
         "Windows",
-        hint="Click the button, then press a key chord or a mouse side-button (Mouse 4 / 5).",
+        hint="Click the button, then press a key chord or a mouse side-button (4 or 5).",
+        section="Opening",
+    ),
+    Setting(
+        "same_app_hotkey",
+        "Current-app shortcut",
+        "hotkey",
+        "Windows",
+        hint="Opens the wheel already fanned out on the app you are in (default Alt + `). "
+        "While the wheel is open, the same key steps through that app's windows.",
+        section="Opening",
     ),
     Setting(
         "open_sticky",
@@ -132,6 +147,14 @@ SETTINGS: tuple[Setting, ...] = (
         "check",
         "Windows",
         hint="Off = classic hold-to-switch: keep holding Alt / your modifiers / the mouse button, then release to switch.",
+        section="Opening",
+    ),
+    Setting(
+        "autostart",
+        "Start Fun Tab when Windows starts",
+        "check",
+        "Windows",
+        section="Opening",
     ),
     Setting(
         "game_compat",
@@ -144,6 +167,7 @@ SETTINGS: tuple[Setting, ...] = (
             ("off", "Off"),
         ),
         hint="When on, Windows keeps Alt+Tab. Use your open shortcut (or Ctrl+Alt+Tab) instead.",
+        section="Games",
     ),
     Setting(
         "pause_in_games",
@@ -151,15 +175,22 @@ SETTINGS: tuple[Setting, ...] = (
         "check",
         "Windows",
         hint="Safest for anti-cheat: removes the keyboard/mouse hooks until you leave the game.",
+        section="Games",
     ),
-    Setting("autostart", "Start Fun Tab when Windows starts", "check", "Windows"),
-    Setting("mru_order", "List the most recently used window first", "check", "Windows"),
+    Setting(
+        "mru_order",
+        "List the most recently used window first",
+        "check",
+        "Windows",
+        section="The wheel",
+    ),
     Setting(
         "group_by_app",
         "One slice per application",
         "check",
         "Windows",
-        hint="Many windows of the same app become one slice. Press ` to cycle them.",
+        hint="Many windows of the same app become one slice. Cycle them with the current-app shortcut.",
+        section="The wheel",
     ),
     Setting(
         "group_pips",
@@ -167,6 +198,7 @@ SETTINGS: tuple[Setting, ...] = (
         "check",
         "Windows",
         hint="Tells you which slices hold several windows before you pick one.",
+        section="The wheel",
     ),
     Setting(
         "subring",
@@ -182,18 +214,36 @@ SETTINGS: tuple[Setting, ...] = (
         "Windows",
         hint="Pinned apps sit at the bottom at the same angle every time, open or not."
         " Selecting a closed one starts it.",
+        section="The wheel",
     ),
-    Setting("minimized_last", "Push minimised windows to the end", "check", "Windows"),
     Setting(
-        "close_key_enabled", "Let Delete and Ctrl+W close a window", "check", "Windows"
+        "minimized_last",
+        "Push minimised windows to the end",
+        "check",
+        "Windows",
+        section="The wheel",
+    ),
+    Setting(
+        "close_key_enabled",
+        "Let Delete and Ctrl+W close a window",
+        "check",
+        "Windows",
+        section="Closing",
     ),
     Setting(
         "close_confirm",
         "Ask before closing a window the first time each session",
         "check",
         "Windows",
+        section="Closing",
     ),
-    Setting("preview_enabled", "Show a picture of the selected window", "check", "Windows"),
+    Setting(
+        "preview_enabled",
+        "Show a picture of the selected window",
+        "check",
+        "Windows",
+        section="Picture",
+    ),
     Setting(
         "preview_position",
         "Where that picture goes",
@@ -206,6 +256,7 @@ SETTINGS: tuple[Setting, ...] = (
             ("bottom-right", "Bottom right"),
             ("bottom-center", "Bottom middle"),
         ),
+        section="Picture",
     ),
     Setting(
         "prefetch_previews",
@@ -213,6 +264,7 @@ SETTINGS: tuple[Setting, ...] = (
         "check",
         "Windows",
         hint="Off by default. When on, Fun Tab photographs nearby windows before you select them.",
+        section="Picture",
     ),
     Setting(
         "capture_minimized",
@@ -220,6 +272,7 @@ SETTINGS: tuple[Setting, ...] = (
         "check",
         "Windows",
         hint="Off by default. When on, Fun Tab briefly restores the window off-screen to photograph it.",
+        section="Picture",
     ),
     # -- Privacy ------------------------------------------------------------
     Setting(
@@ -354,17 +407,19 @@ class SettingsWindow:
         self._snapping = False
         self._hotkey_buttons: dict = {}
         self._exclude_exes = list(cfg.exclude_exes)
-        self._pinned_exes = list(cfg.pinned_exes)
+        self._pinned_slots = [dict(slot) for slot in cfg.slots]
         self._listboxes: dict = {}
 
         self.root = tk.Tk()
         self.root.title(WINDOW_TITLE)
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         # DPI awareness is on for the screenshot to be at real pixels, which
         # means Tk will not scale itself and everything must be told to.
         self.ui = dpi / 96.0
         self.root.tk.call("tk", "scaling", dpi / 72.0)
         self._set_icon()
+        self._hint_wrap = self.px(TAB_W - 36)
+        self._style_labels()
 
         self.vars: dict[str, Any] = {}
         self._labels: dict[str, Any] = {}
@@ -372,11 +427,18 @@ class SettingsWindow:
 
         # Controls beside the preview rather than under it: stacked, the window
         # is taller than a 1080p screen once the picture is big enough to read.
-        body = ttk.Frame(self.root, padding=self.px(12))
+        # Tabs scroll instead, so this column can stay beside the preview.
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        body = ttk.Frame(self.root, padding=self.px(16))
         body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
 
         left = ttk.Frame(body)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, self.px(12)))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, self.px(16)))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
         right = ttk.Frame(body)
         right.grid(row=0, column=1, sticky="n")
 
@@ -400,6 +462,7 @@ class SettingsWindow:
 
         self.status = ttk.Label(left, text="", foreground="#1a7f37")
         self.status.grid(row=2, column=0, sticky="w", pady=(self.px(8), 0))
+        self.root.minsize(self.px(TAB_W + PANEL_W + 64), self.px(TAB_H + 120))
 
         self.preview = ttk.Label(right, anchor="center")
         self.preview.grid(row=0, column=0)
@@ -414,7 +477,7 @@ class SettingsWindow:
         self.root.bind("<Escape>", lambda _e: self.on_cancel())
         self._load(cfg)
         self.pump.request(self.collect())
-        self.root.after(60, self._poll_preview)
+        self._poll_id = self.root.after(60, self._poll_preview)
 
     # -- layout ------------------------------------------------------------
 
@@ -431,24 +494,95 @@ class SettingsWindow:
             except Exception:
                 pass
 
-    def _build_group(self, parent, group: str):
+    def _style_labels(self) -> None:
         ttk = self.ttk
-        frame = ttk.Frame(parent, padding=self.px(12))
+        style = ttk.Style(self.root)
+        style.configure("Hint.TLabel", foreground="#666666")
+        try:
+            import tkinter.font as tkfont
+
+            heading = tkfont.nametofont("TkDefaultFont").copy()
+            heading.configure(weight="bold")
+            style.configure("Heading.TLabel", font=heading)
+        except Exception:
+            pass
+
+    def _scrollable_page(self, parent):
+        tk, ttk = self.tk, self.ttk
+        holder = ttk.Frame(parent)
+        holder.columnconfigure(0, weight=1)
+        holder.rowconfigure(0, weight=1)
+        bg = ttk.Style(self.root).lookup("TFrame", "background") or "SystemButtonFace"
+        canvas = tk.Canvas(
+            holder,
+            width=self.px(TAB_W),
+            height=self.px(TAB_H),
+            highlightthickness=0,
+            borderwidth=0,
+            background=bg,
+        )
+        scrollbar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, padding=(self.px(16), self.px(12), self.px(10), self.px(16)))
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid_remove()
+
+        def sync(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
+            bbox = canvas.bbox("all")
+            overflow = bool(bbox and bbox[3] > canvas.winfo_height() + 1)
+            if overflow:
+                scrollbar.grid()
+            else:
+                scrollbar.grid_remove()
+                canvas.yview_moveto(0)
+
+        def stretch(event) -> None:
+            canvas.itemconfigure(window_id, width=max(event.width, 1))
+            sync()
+
+        inner.bind("<Configure>", sync)
+        canvas.bind("<Configure>", stretch)
+
+        def on_wheel(event) -> None:
+            bbox = canvas.bbox("all")
+            if not bbox or bbox[3] <= canvas.winfo_height() + 1:
+                return
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        def bind_tree(widget) -> None:
+            if widget.winfo_class() != "Listbox":
+                widget.bind("<MouseWheel>", on_wheel)
+            for child in widget.winfo_children():
+                bind_tree(child)
+
+        holder.after_idle(lambda: bind_tree(holder))
+        return holder, inner
+
+    def _build_section(self, frame, title: str, row: int) -> int:
+        pad_top = 0 if row == 0 else self.px(18)
+        self.ttk.Label(frame, text=title, style="Heading.TLabel").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(pad_top, self.px(6))
+        )
+        return row + 1
+
+    def _build_group(self, parent, group: str):
+        holder, frame = self._scrollable_page(parent)
         frame.columnconfigure(1, weight=1)
         row = 0
+        section = ""
         for setting in SETTINGS:
             if setting.group != group:
                 continue
+            if setting.section and setting.section != section:
+                section = setting.section
+                row = self._build_section(frame, section, row)
             row = self._build_control(frame, setting, row)
         if group == "Windows":
-            row = self._build_exe_list(
-                frame,
-                row,
-                attr="_pinned_exes",
-                title="Pinned apps (in slot order)",
-                hint="Each one gets a fixed place at the bottom of the wheel, whether or not"
-                " it is running. Selecting a closed one starts it.",
-            )
+            row = self._build_pin_list(frame, row)
         if group == "Privacy":
             row = self._build_exe_list(
                 frame,
@@ -457,11 +591,12 @@ class SettingsWindow:
                 title="Hidden apps",
                 hint="These never appear on the wheel. Password managers are always hidden.",
             )
-        return frame
+        return holder
 
     def _build_control(self, frame, setting: Setting, row: int) -> int:
         tk, ttk = self.tk, self.ttk
-        pad = {"pady": self.px(3)}
+        bottom = self.px(2) if setting.hint else self.px(8)
+        pad = {"pady": (self.px(4), bottom)}
 
         if setting.kind == "check":
             var = self._autostart if setting.key == "autostart" else tk.BooleanVar()
@@ -474,14 +609,15 @@ class SettingsWindow:
             var = tk.StringVar()
             self.vars[setting.key] = var
             ttk.Label(frame, text=setting.label).grid(row=row, column=0, sticky="w", **pad)
+            longest = max((len(label) for _value, label in setting.choices), default=18)
             box = ttk.Combobox(
                 frame,
                 textvariable=var,
                 state="readonly",
-                width=26,
+                width=min(42, max(18, longest + 1)),
                 values=[label for _value, label in setting.choices],
             )
-            box.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+            box.grid(row=row, column=1, columnspan=2, sticky="w", padx=(self.px(8), 0), **pad)
             box.bind("<<ComboboxSelected>>", lambda _e: self.on_change())
 
         elif setting.kind == "slider":
@@ -491,16 +627,18 @@ class SettingsWindow:
             # Inverted sliders flip from_/to so dragging right means "better".
             s_from = setting.high if setting.invert else setting.low
             s_to   = setting.low  if setting.invert else setting.high
+            holder = ttk.Frame(frame)
+            holder.grid(row=row, column=1, columnspan=2, sticky="w", padx=(self.px(8), 0), **pad)
             ttk.Scale(
-                frame,
+                holder,
                 from_=s_from,
                 to=s_to,
                 variable=var,
                 command=lambda _v, s=setting: self.on_slide(s),
                 length=self.px(220),
-            ).grid(row=row, column=1, sticky="w", **pad)
-            readout = ttk.Label(frame, text="", width=6)
-            readout.grid(row=row, column=2, sticky="w", **pad)
+            ).grid(row=0, column=0, sticky="w")
+            readout = ttk.Label(holder, text="", width=6)
+            readout.grid(row=0, column=1, sticky="w", padx=(self.px(8), 0))
             self._labels[setting.key] = readout
 
         elif setting.kind == "accent":
@@ -508,7 +646,7 @@ class SettingsWindow:
             self.vars[setting.key] = var
             ttk.Label(frame, text=setting.label).grid(row=row, column=0, sticky="w", **pad)
             holder = ttk.Frame(frame)
-            holder.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+            holder.grid(row=row, column=1, columnspan=2, sticky="w", padx=(self.px(8), 0), **pad)
             ttk.Radiobutton(
                 holder,
                 text="Match Windows",
@@ -528,10 +666,10 @@ class SettingsWindow:
             self.vars[setting.key] = var
             ttk.Label(frame, text=setting.label).grid(row=row, column=0, sticky="w", **pad)
             holder = ttk.Frame(frame)
-            holder.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+            holder.grid(row=row, column=1, columnspan=2, sticky="w", padx=(self.px(8), 0), **pad)
             button = tk.Button(
                 holder,
-                text=parse_hotkey(var.get() or "alt+tab").label(),
+                text=parse_hotkey(var.get() or getattr(Config(), setting.key)).label(),
                 width=28,
                 command=lambda s=setting: self.on_capture_hotkey(s),
                 relief="groove",
@@ -544,33 +682,72 @@ class SettingsWindow:
 
         if setting.hint:
             row += 1
-            self.ttk.Label(frame, text=setting.hint, foreground="#666666").grid(
-                row=row, column=0, columnspan=3, sticky="w", pady=(0, self.px(4))
+            indent = self.px(22) if setting.kind == "check" else 0
+            self.ttk.Label(
+                frame,
+                text=setting.hint,
+                style="Hint.TLabel",
+                wraplength=self._hint_wrap,
+                justify="left",
+            ).grid(
+                row=row,
+                column=0,
+                columnspan=3,
+                sticky="w",
+                padx=(indent, 0),
+                pady=(0, self.px(10)),
             )
         return row + 1
 
     def _build_exe_list(self, frame, row: int, *, attr: str, title: str, hint: str) -> int:
         ttk = self.ttk
-        ttk.Label(frame, text=title).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(self.px(8), self.px(2))
-        )
-        row += 1
+        row = self._build_section(frame, title, row)
         box = self.tk.Listbox(frame, height=5, exportselection=False)
         box.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=self.px(2))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=row, column=2, sticky="n", padx=(self.px(6), 0))
+        buttons.grid(row=row, column=2, sticky="n", padx=(self.px(8), 0))
         ttk.Button(
             buttons, text="Add…", command=lambda a=attr: self._add_exe(a)
-        ).grid(row=0, column=0, sticky="ew", pady=(0, self.px(4)))
+        ).grid(row=0, column=0, sticky="ew", pady=(0, self.px(6)))
         ttk.Button(
             buttons, text="Remove", command=lambda a=attr: self._remove_exe(a)
         ).grid(row=1, column=0, sticky="ew")
         self._listboxes[attr] = box
         self._fill_exe_list(attr)
         row += 1
-        ttk.Label(frame, text=hint, foreground="#666666").grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(0, self.px(4))
+        ttk.Label(
+            frame,
+            text=hint,
+            style="Hint.TLabel",
+            wraplength=self._hint_wrap,
+            justify="left",
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(self.px(6), self.px(4)))
+        return row + 1
+
+    def _build_pin_list(self, frame, row: int) -> int:
+        ttk = self.ttk
+        row = self._build_section(frame, "Pinned apps", row)
+        box = self.tk.Listbox(frame, height=5, exportselection=False)
+        box.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=self.px(2))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=2, sticky="n", padx=(self.px(8), 0))
+        ttk.Button(buttons, text="Browse…", command=self._add_pin).grid(
+            row=0, column=0, sticky="ew", pady=(0, self.px(6))
         )
+        ttk.Button(buttons, text="Remove", command=self._remove_pin).grid(
+            row=1, column=0, sticky="ew"
+        )
+        self._listboxes["_pinned_slots"] = box
+        self._fill_pin_list()
+        row += 1
+        ttk.Label(
+            frame,
+            text="In slot order. Browse for an .exe or a shortcut (.lnk) so a closed "
+            "app can still be started from the wheel.",
+            style="Hint.TLabel",
+            wraplength=self._hint_wrap,
+            justify="left",
+        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(self.px(6), self.px(4)))
         return row + 1
 
     def _exe_names(self, attr: str) -> list[str]:
@@ -608,6 +785,83 @@ class SettingsWindow:
         self._fill_exe_list(attr)
         self.on_change()
 
+    def _pin_label(self, slot: dict) -> str:
+        label = str(slot.get("label") or "").strip()
+        exe = str(slot.get("exe") or "").strip()
+        if label and exe:
+            return f"{label}  ({exe})"
+        return label or exe or "(pin)"
+
+    def _fill_pin_list(self) -> None:
+        box = self._listboxes.get("_pinned_slots")
+        if box is None:
+            return
+        box.delete(0, "end")
+        for slot in self._pinned_slots:
+            box.insert("end", self._pin_label(slot))
+
+    def _add_pin(self) -> None:
+        from tkinter import filedialog
+
+        from .config import MAX_SLOTS
+        from .windows_enum import slot_from_path
+
+        picked = filedialog.askopenfilename(
+            parent=self.root,
+            title="Pin an app",
+            filetypes=(
+                ("Programs and shortcuts", "*.exe *.lnk"),
+                ("Programs", "*.exe"),
+                ("Shortcuts", "*.lnk"),
+                ("All files", "*.*"),
+            ),
+        )
+        if not picked:
+            return
+        slot = slot_from_path(picked)
+        if not slot:
+            self.status.configure(
+                text="Pick an .exe or a shortcut (.lnk).",
+                foreground="#b3261e",
+            )
+            return
+        exe = str(slot.get("exe") or "").lower()
+        replaced = False
+        if exe:
+            for existing in self._pinned_slots:
+                if str(existing.get("exe") or "").lower() == exe:
+                    existing.update(slot)
+                    replaced = True
+                    break
+        if not replaced:
+            if len(self._pinned_slots) >= MAX_SLOTS:
+                self.status.configure(
+                    text=f"The wheel keeps at most {MAX_SLOTS} pinned apps.",
+                    foreground="#666666",
+                )
+                return
+            self._pinned_slots.append(slot)
+        for index, item in enumerate(self._pinned_slots):
+            item["index"] = index
+        self._fill_pin_list()
+        self.on_change()
+
+    def _remove_pin(self) -> None:
+        box = self._listboxes.get("_pinned_slots")
+        if box is None:
+            return
+        selection = list(box.curselection())
+        if not selection:
+            return
+        drop = set(selection)
+        self._pinned_slots = [
+            slot for i, slot in enumerate(self._pinned_slots) if i not in drop
+        ]
+        for index, slot in enumerate(self._pinned_slots):
+            slot["index"] = index
+        self._fill_pin_list()
+        self.on_change()
+
     # -- values ------------------------------------------------------------
 
     def _load(self, cfg: Config) -> None:
@@ -628,9 +882,9 @@ class SettingsWindow:
             if setting.kind == "hotkey":
                 self._refresh_hotkey_button(setting.key)
         self._exclude_exes = list(cfg.exclude_exes)
-        self._pinned_exes = list(cfg.pinned_exes)
-        for attr in ("_exclude_exes", "_pinned_exes"):
-            self._fill_exe_list(attr)
+        self._pinned_slots = [dict(slot) for slot in cfg.slots]
+        self._fill_exe_list("_exclude_exes")
+        self._fill_pin_list()
         self._refresh_swatch()
 
     def _refresh_hotkey_button(self, key: str) -> None:
@@ -639,7 +893,11 @@ class SettingsWindow:
         button = getattr(self, "_hotkey_buttons", {}).get(key)
         if button is None:
             return
-        button.configure(text=parse_hotkey(str(self.vars[key].get())).label())
+        button.configure(
+            text=parse_hotkey(
+                str(self.vars[key].get()) or getattr(Config(), key)
+            ).label()
+        )
 
     def collect(self) -> Config:
         values: dict[str, Any] = {}
@@ -652,7 +910,7 @@ class SettingsWindow:
             )
         cfg = config_with(self.cfg, values)
         cfg.exclude_exes = list(self._exclude_exes)
-        cfg.set_slot_order(self._pinned_exes)
+        cfg.slots = [dict(slot) for slot in self._pinned_slots]
         cfg.clamp()
         return cfg
 
@@ -703,7 +961,7 @@ class SettingsWindow:
             self.on_change()
 
     def on_reset_hotkey(self, setting: Setting) -> None:
-        self.vars[setting.key].set("alt+tab")
+        self.vars[setting.key].set(getattr(Config(), setting.key))
         self._refresh_hotkey_button(setting.key)
         self.on_change()
 
@@ -730,7 +988,7 @@ class SettingsWindow:
         self._refresh_hotkey_button(setting.key)
         self.on_change()
         self.status.configure(
-            text=f"Open shortcut set to {parse_hotkey(text).label()}",
+            text=f"{setting.label} set to {parse_hotkey(text).label()}",
             foreground="#1a7f37",
         )
 
@@ -749,11 +1007,19 @@ class SettingsWindow:
         _set_autostart(bool(self._autostart.get()))
         self.cfg = cfg
         self.saved = True
-        self.pump.stop()
-        self.root.destroy()
+        self._stop_window()
 
     def on_cancel(self) -> None:
+        self._stop_window()
+
+    def _stop_window(self) -> None:
         self.pump.stop()
+        poll_id = getattr(self, "_poll_id", None)
+        if poll_id is not None:
+            try:
+                self.root.after_cancel(poll_id)
+            except Exception:
+                pass
         self.root.destroy()
 
     # -- preview -----------------------------------------------------------
@@ -767,7 +1033,8 @@ class SettingsWindow:
             pass
         if image is not None:
             self._show(image)
-        self.root.after(60, self._poll_preview)
+        if self.root.winfo_exists():
+            self._poll_id = self.root.after(60, self._poll_preview)
 
     def _show(self, image) -> None:
         from PIL import ImageTk

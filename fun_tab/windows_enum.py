@@ -303,6 +303,65 @@ def _icon_from_exe(path: str) -> Optional[Image.Image]:
             pass
 
 
+class _SHFILEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("hIcon", wintypes.HICON),
+        ("iIcon", ctypes.c_int),
+        ("dwAttributes", wintypes.DWORD),
+        ("szDisplayName", ctypes.c_wchar * 260),
+        ("szTypeName", ctypes.c_wchar * 80),
+    ]
+
+
+_SHGFI_ICON = 0x000000100
+_SHGFI_LARGEICON = 0x000000000
+_shell_info_ready = False
+
+
+def _icon_from_shell(path: str) -> Optional[Image.Image]:
+    """The icon Explorer shows for this file — including a shortcut's custom one.
+
+    ExtractIconEx often returns nothing for .lnk files; SHGetFileInfo is the
+    same lookup the desktop uses.
+    """
+    if not path:
+        return None
+    global _shell_info_ready
+    if not _shell_info_ready:
+        w.shell32.SHGetFileInfoW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(_SHFILEINFOW),
+            wintypes.UINT,
+            wintypes.UINT,
+        ]
+        w.shell32.SHGetFileInfoW.restype = ctypes.c_void_p
+        _shell_info_ready = True
+    info = _SHFILEINFOW()
+    try:
+        result = w.shell32.SHGetFileInfoW(
+            path, 0, ctypes.byref(info), ctypes.sizeof(info), _SHGFI_ICON | _SHGFI_LARGEICON
+        )
+    except OSError:
+        return None
+    if not result or not info.hIcon:
+        return None
+    try:
+        return _hicon_to_image(int(info.hIcon))
+    finally:
+        try:
+            w.user32.DestroyIcon(info.hIcon)
+        except OSError:
+            pass
+
+
+def _icon_from_file(path: str) -> Optional[Image.Image]:
+    """Best available icon for an .exe or a shortcut on disk."""
+    if not path:
+        return None
+    return _icon_from_exe(path) or _icon_from_shell(path)
+
+
 def _extract_icon(hwnd: int, exe_path: str) -> Optional[Image.Image]:
     with _icon_lock:
         if hwnd in _icon_by_hwnd:
@@ -327,7 +386,7 @@ def _extract_icon(hwnd: int, exe_path: str) -> Optional[Image.Image]:
                 break
 
     if icon is None:
-        icon = _icon_from_exe(exe_path)
+        icon = _icon_from_file(exe_path)
 
     if icon is None:
         icon = _placeholder_icon()
@@ -347,6 +406,59 @@ def _placeholder_icon() -> Image.Image:
     draw.rounded_rectangle((8, 8, 88, 88), radius=20, fill=(196, 202, 214, 235))
     draw.rounded_rectangle((8, 8, 88, 30), radius=10, fill=(150, 158, 176, 235))
     return img
+
+
+def _icon_key(name: str) -> str:
+    raw = os.path.basename(str(name or "").strip()).lower()
+    if not raw:
+        return ""
+    keep = []
+    for ch in raw:
+        keep.append(ch if ch.isalnum() or ch in "._-" else "_")
+    return "".join(keep)[:80]
+
+
+def stock_icon(name: str, icon: Optional[Image.Image]) -> None:
+    """Remember a pin's logo so the closed slot can show it later."""
+    key = _icon_key(name)
+    if not key or icon is None:
+        return
+    try:
+        from .config import _ensure_private_dir, icon_dir
+
+        folder = icon_dir()
+        _ensure_private_dir(folder)
+        path = folder / f"{key}.png"
+        icon.convert("RGBA").resize((ICON_PX, ICON_PX), Image.Resampling.LANCZOS).save(
+            path, format="PNG"
+        )
+    except OSError:
+        return
+    with _icon_lock:
+        _icon_by_exe[key] = icon
+        _icon_by_exe[name] = icon
+
+
+def load_stocked_icon(name: str) -> Optional[Image.Image]:
+    key = _icon_key(name)
+    if not key:
+        return None
+    with _icon_lock:
+        cached = _icon_by_exe.get(key) or _icon_by_exe.get(name)
+    if cached is not None:
+        return cached
+    try:
+        from .config import icon_dir
+
+        path = icon_dir() / f"{key}.png"
+        if not path.is_file():
+            return None
+        icon = Image.open(path).convert("RGBA")
+    except OSError:
+        return None
+    with _icon_lock:
+        _icon_by_exe.setdefault(key, icon)
+    return icon
 
 
 def prune_icon_cache(live_hwnds: Iterable[int]) -> None:
@@ -607,37 +719,47 @@ def _dead_slot(slot: dict, index: int) -> AppWindow:
     exists, which is precisely why the slot keeps its position when it closes.
     """
     exe = str(slot.get("exe") or "").strip()
+    launch = str(slot.get("launch") or "").strip() or exe
     label = str(slot.get("label") or "").strip()
     if not label:
-        label = os.path.splitext(os.path.basename(exe))[0].title() if exe else "Empty slot"
+        source = launch or exe
+        label = os.path.splitext(os.path.basename(source))[0].title() if source else "Empty slot"
+    icon_src = launch if os.path.isfile(launch) else exe
+    exe_path = launch if os.path.splitext(launch)[1].lower() == ".exe" else exe
     return AppWindow(
         hwnd=0,
         title=label,
         class_name="",
         pid=0,
-        # Straight off the executable on disk, because there is no window to ask.
-        # A slot the user cannot recognise is not worth reserving an angle for.
-        icon=_slot_icon(exe),
-        exe_path=exe,
+        # Prefer the recorded launch file (exe or shortcut) so a closed pin
+        # still has an icon. A slot the user cannot recognise is not worth
+        # reserving an angle for.
+        icon=_slot_icon(icon_src, key=exe),
+        exe_path=exe_path,
         app_name=label,
         aumid=str(slot.get("aumid") or "").strip(),
         slot=index,
-        launch=str(slot.get("launch") or "").strip() or exe,
+        launch=launch,
         running=False,
     )
 
 
-def _slot_icon(exe: str) -> Optional[Image.Image]:
-    """Icon for a closed app, resolved from the executable and cached by path."""
-    if not exe:
+def _slot_icon(path: str, *, key: str = "") -> Optional[Image.Image]:
+    """Icon for a closed app: stocked logo first, then whatever is on disk."""
+    stocked = load_stocked_icon(key or path)
+    if stocked is not None:
+        return stocked
+    if not path:
         return _placeholder_icon()
     with _icon_lock:
-        cached = _icon_by_exe.get(exe)
+        cached = _icon_by_exe.get(path)
     if cached is not None:
         return cached
-    icon = _icon_from_exe(exe) or _resolve_exe_icon(exe) or _placeholder_icon()
+    icon = _icon_from_file(path) or _resolve_exe_icon(path)
+    if icon is None:
+        return _placeholder_icon()
     with _icon_lock:
-        _icon_by_exe.setdefault(exe, icon)
+        _icon_by_exe.setdefault(path, icon)
     return icon
 
 
@@ -646,7 +768,7 @@ def _resolve_exe_icon(exe: str) -> Optional[Image.Image]:
     if os.path.dirname(exe):
         return None
     found = shutil.which(exe)
-    return _icon_from_exe(found) if found else None
+    return _icon_from_file(found) if found else None
 
 
 def assign_slots(
@@ -677,6 +799,9 @@ def assign_slots(
         claimed.add(live.hwnd)
         claimed.update(live.peer_hwnds)
         launch = str(slot.get("launch") or "").strip() or launch_target(live)
+        exe = str(slot.get("exe") or live.exe_name or "").strip()
+        if live.icon is not None and exe:
+            stock_icon(exe, live.icon)
         lane.append(replace(live, slot=position, launch=launch, running=True))
 
     mru = [a for a in apps if a.hwnd not in claimed]
@@ -734,6 +859,40 @@ def launch_app(target: str, fallback: str = "") -> bool:
     if w.shell_execute(target):
         return True
     return bool(fallback) and fallback != target and w.shell_execute(fallback)
+
+
+_PIN_FILE_EXTS = {".exe", ".lnk", ".bat", ".cmd", ".com"}
+
+
+def slot_from_path(path: str) -> dict | None:
+    """A lane slot from an .exe or a shortcut the user picked in Settings.
+
+    The full path is recorded as ``launch`` so a closed pin can still be
+    started. Bare executable names cannot — ShellExecute has nowhere to look.
+    """
+    raw = os.path.expandvars(str(path or "").strip().strip('"'))
+    if not raw:
+        return None
+    full = os.path.abspath(os.path.normpath(raw))
+    if not os.path.isfile(full):
+        return None
+    ext = os.path.splitext(full)[1].lower()
+    if ext not in _PIN_FILE_EXTS:
+        return None
+    target = full
+    if ext == ".lnk":
+        resolved = w.resolve_shortcut(full)
+        if resolved and os.path.splitext(resolved)[1].lower() == ".exe":
+            target = resolved
+    base = os.path.basename(target)
+    stem, base_ext = os.path.splitext(base)
+    exe = (base if base_ext.lower() == ".exe" else f"{stem}.exe").lower()
+    label = os.path.splitext(os.path.basename(full))[0].strip() or stem
+    icon = _icon_from_file(full) or _icon_from_file(target)
+    if icon is not None:
+        stock_icon(exe, icon)
+    slot = {"exe": exe, "launch": full, "label": label[:64]}
+    return slot
 
 
 def activate_window(hwnd: int) -> bool:
