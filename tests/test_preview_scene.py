@@ -68,14 +68,21 @@ def test_more_blur_softens_the_desktop(scene):
 
 
 def test_dim_mode_darkens_without_blurring(scene):
-    dimmed = scene.render(Config(backdrop="dim", dim_veil=120))
-    blurred = scene.render(Config(backdrop="blur", dim_blur=1.0, dim_veil=120))
+    # Theme pinned: the blur path's veil tints toward the theme's card colour,
+    # so this comparison's margin depends on light vs dark unless fixed here.
+    dimmed = scene.render(Config(backdrop="dim", dim_veil=120, theme="dark"))
+    blurred = scene.render(Config(backdrop="blur", dim_blur=1.0, dim_veil=120, theme="dark"))
     assert edges(dimmed) > edges(blurred)
 
 
 def test_more_veil_darkens_the_desktop(scene):
-    light = brightness(scene.render(Config(dim_veil=0)))
-    dark = brightness(scene.render(Config(dim_veil=200)))
+    # Theme pinned: in light mode the veil tints toward a near-white card
+    # colour, so "more veil" brightens rather than darkens — that's correct
+    # acrylic behaviour, not a bug, but it means this assertion only holds
+    # for a specific theme and must not depend on whichever one the machine
+    # running the suite happens to have set.
+    light = brightness(scene.render(Config(dim_veil=0, theme="dark")))
+    dark = brightness(scene.render(Config(dim_veil=200, theme="dark")))
     assert dark < light * 0.7
 
 

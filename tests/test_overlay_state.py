@@ -389,7 +389,10 @@ def test_reconfiguring_drops_the_cached_pixels():
 
 
 def test_theme_change_does_not_serve_stale_frames():
-    o = wheel()
+    # Pinned explicitly: "auto" reads the real Windows theme registry key, so
+    # relying on it would make this pass or fail by whatever theme happens to
+    # be set on the machine running the suite, dev box or CI runner alike.
+    o = wheel(theme="dark")
     dark_frame = o._compose(time.perf_counter())
     o.apply_config(Config(preview_enabled=False, theme="light"))
     o._rebuild_layers()
