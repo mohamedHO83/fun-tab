@@ -172,6 +172,19 @@ def test_custom_keyboard_hotkey_replaces_alt_tab():
     assert kb.actions() == [(hook_mod.OPEN, {"sticky": True, "reverse": False})]
 
 
+def test_a_bare_key_hotkey_cannot_be_set_at_all():
+    """`set_open_hotkey` goes through `parse_hotkey`, which refuses a
+    modifier-less key chord — otherwise that key would be swallowed, and
+    unusable everywhere, every time it's pressed with nothing held down."""
+    kb = Keyboard()
+    kb.hook.set_open_hotkey("a")
+    assert kb.hook.open_hotkey.alt and kb.hook.open_hotkey.code == w.VK_TAB, (
+        "a bare key must fall back to the default, not become the shortcut"
+    )
+    assert kb.press(ord("A")) is False
+    assert kb.actions() == []
+
+
 def test_modifier_chord_holds_open_until_a_modifier_lifts():
     """Ctrl+Shift+U must not die because Alt was never held."""
     kb = Keyboard()

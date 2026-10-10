@@ -62,6 +62,19 @@ def test_alt_backtick_round_trips():
     assert parse_hotkey(hk.text()) == hk
 
 
+def test_a_bare_key_with_no_modifier_falls_back_to_the_default():
+    """A modifier-less key chord would be swallowed every time it's pressed,
+    anywhere — not just as an open gesture."""
+    hk = parse_hotkey("a")
+    assert hk == parse_hotkey("")
+
+
+def test_a_bare_mouse_button_is_still_allowed():
+    """Mouse side buttons never collide with typing, so they need no modifier."""
+    hk = parse_hotkey("mouse4")
+    assert hk.kind == "mouse" and hk.code == MOUSE4
+
+
 def test_unknown_same_app_chord_falls_back_to_alt_backtick():
     assert parse_hotkey("not-a-key", fallback=alt_backtick()) == alt_backtick()
 

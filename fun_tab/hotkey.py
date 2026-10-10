@@ -161,6 +161,12 @@ def parse_hotkey(text: str | None, *, fallback: Hotkey | None = None) -> Hotkey:
     vk = _KEY_NAMES.get(trigger)
     if vk is None:
         return default
+    if not (ctrl or alt or shift or win):
+        # A keyboard trigger with no modifier would be swallowed everywhere
+        # it's pressed, not just as an open gesture — unlike a bare mouse
+        # side button, which never collides with typing. Refuse it the same
+        # way an unreadable or corrupt setting falls back to the default.
+        return default
     return Hotkey(ctrl=ctrl, alt=alt, shift=shift, win=win, kind="key", code=vk)
 
 

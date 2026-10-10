@@ -1091,6 +1091,13 @@ def _capture_hotkey(timeout_s: float = 6.0):
             ):
                 return w.user32.CallNextHookEx(kb_hook, n_code, wparam, lparam)
             ctrl, alt, shift, win_key = mods()
+            # A bare key with no modifier would be swallowed everywhere once
+            # saved — Escape is exempt since it cancels the capture instead of
+            # becoming the shortcut. Anything else needs a modifier held, so
+            # a key pressed without one just falls through to whatever the
+            # user is actually doing and capture keeps listening.
+            if not (ctrl or alt or shift or win_key) and vk != w.VK_ESCAPE:
+                return w.user32.CallNextHookEx(kb_hook, n_code, wparam, lparam)
             # The trigger key itself may still report as held — ignore that.
             result.append(
                 Hotkey(ctrl=ctrl, alt=alt, shift=shift, win=win_key, kind="key", code=vk)
