@@ -6,6 +6,12 @@ import ctypes
 import threading
 from ctypes import wintypes
 
+# ctypes.wintypes only grew HCURSOR in newer Pythons than the 3.10 this
+# project claims to support (and than CI's 3.12 actually has). The real
+# Windows SDK defines HCURSOR as HICON (winnt.h: `typedef HICON HCURSOR;`),
+# so that's exactly as correct as the stdlib's own definition would be.
+HCURSOR = getattr(wintypes, "HCURSOR", wintypes.HICON)
+
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -255,7 +261,7 @@ class WNDCLASSEXW(ctypes.Structure):
         ("cbWndExtra", ctypes.c_int),
         ("hInstance", wintypes.HINSTANCE),
         ("hIcon", wintypes.HICON),
-        ("hCursor", wintypes.HCURSOR),
+        ("hCursor", HCURSOR),
         ("hbrBackground", wintypes.HBRUSH),
         ("lpszMenuName", wintypes.LPCWSTR),
         ("lpszClassName", wintypes.LPCWSTR),
@@ -468,7 +474,7 @@ user32.PostThreadMessageW.argtypes = [
 ]
 user32.PostThreadMessageW.restype = wintypes.BOOL
 user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
-user32.LoadCursorW.restype = wintypes.HCURSOR
+user32.LoadCursorW.restype = HCURSOR
 gdi32.GetStockObject.argtypes = [ctypes.c_int]
 gdi32.GetStockObject.restype = wintypes.HGDIOBJ
 dwmapi.DwmGetWindowAttribute.argtypes = [
