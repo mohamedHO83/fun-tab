@@ -196,6 +196,11 @@ class Config:
     # First-run disclosure; bumped in privacy.CONSENT_VERSION when the text changes.
     consent_version: int = 0
 
+    # --- updates ------------------------------------------------------------
+    # One request to GitHub's public release API, a few seconds after start,
+    # once per run. No other data is sent. Off under privacy mode.
+    check_for_updates: bool = True
+
     # --- raw colour overrides (theme key -> "#RRGGBB" or [r,g,b,a]) -------
     colors: dict[str, Any] = field(default_factory=dict)
 

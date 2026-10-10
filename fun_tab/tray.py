@@ -36,6 +36,7 @@ _ID_EDIT = 4
 _ID_RELOAD = 5
 _ID_ABOUT = 6
 _ID_QUIT = 7
+_ID_UPDATE = 8
 
 
 def _guid() -> w.GUID:
@@ -136,6 +137,7 @@ class TrayIcon:
         self._own_icon = False
         self._wndproc = None
         self._taskbar_created = 0
+        self._update_url: str | None = None
 
     def install(self) -> bool:
         hinstance = w.kernel32.GetModuleHandleW(None)
@@ -177,6 +179,23 @@ class TrayIcon:
             return
         nid = self._nid(w.NIF_TIP | w.NIF_GUID | w.NIF_SHOWTIP)
         nid.szTip = "Fun Tab (paused)" if paused else "Fun Tab"
+        if w.shell32.Shell_NotifyIconW(w.NIM_MODIFY, ctypes.byref(nid)):
+            return
+        nid.uFlags &= ~w.NIF_GUID
+        nid.uID = 1
+        w.shell32.Shell_NotifyIconW(w.NIM_MODIFY, ctypes.byref(nid))
+
+    def notify_update(self, version: str, url: str) -> None:
+        """A balloon plus a standing menu item, the one time a newer release
+        is confirmed. Called from the UI thread, same as everything else that
+        talks to the shell — the lookup itself runs on a worker thread."""
+        self._update_url = url
+        if not self.hwnd:
+            return
+        nid = self._nid(w.NIF_INFO)
+        nid.szInfoTitle = "Fun Tab update available"
+        nid.szInfo = f"Version {version} is ready. Right-click the tray icon to download it."
+        nid.dwInfoFlags = w.NIIF_INFO | w.NIIF_NOSOUND
         if w.shell32.Shell_NotifyIconW(w.NIM_MODIFY, ctypes.byref(nid)):
             return
         nid.uFlags &= ~w.NIF_GUID
@@ -276,6 +295,9 @@ class TrayIcon:
             w.user32.AppendMenuW(menu, w.MF_STRING, _ID_SETTINGS, "Settings…")
             w.user32.SetMenuDefaultItem(menu, _ID_SETTINGS, 0)
             w.user32.AppendMenuW(menu, w.MF_SEPARATOR, 0, None)
+            if self._update_url:
+                w.user32.AppendMenuW(menu, w.MF_STRING, _ID_UPDATE, "Download update…")
+                w.user32.AppendMenuW(menu, w.MF_SEPARATOR, 0, None)
             auto_flags = w.MF_STRING | (
                 w.MF_CHECKED if autostart.is_enabled() else w.MF_UNCHECKED
             )
@@ -331,5 +353,11 @@ class TrayIcon:
             )
         elif choice == _ID_ABOUT:
             self.app.show_about()
+        elif choice == _ID_UPDATE:
+            if self._update_url:
+                try:
+                    os.startfile(self._update_url)  # noqa: S606 - user-initiated
+                except OSError:
+                    pass
         elif choice == _ID_QUIT:
             self.app.shutdown()

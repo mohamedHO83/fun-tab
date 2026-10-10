@@ -134,6 +134,13 @@ def test_group_by_app_is_on_by_default():
     assert Config().group_by_app is True
 
 
+def test_update_checks_default_to_on(tmp_path):
+    assert Config().check_for_updates is True
+    path = tmp_path / "config.json"
+    Config(check_for_updates=False).save(path)
+    assert Config.load(path).check_for_updates is False
+
+
 def test_exe_lists_are_normalised_on_clamp():
     cfg = Config(exclude_exes=["Chrome", r"C:\Apps\Slack.EXE", "chrome.exe", ""])
     cfg.set_slot_order(["Spotify", "chrome"])

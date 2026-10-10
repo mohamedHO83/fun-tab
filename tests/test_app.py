@@ -346,3 +346,33 @@ def test_manual_pause_keeps_hooks_uninstalled(monkeypatch):
     app.set_paused(False)
     assert app._paused_manually is False
     assert app.hook.installed is True
+
+
+class _FakeTray:
+    def __init__(self):
+        self.calls = []
+
+    def notify_update(self, version, url):
+        self.calls.append((version, url))
+
+
+def test_a_confirmed_update_is_announced_once():
+    app = FunTabApp()
+    tray = _FakeTray()
+    app._tray = tray
+    app._update = ("0.5.0", "https://example.test/release")
+
+    app._maybe_announce_update()
+    app._maybe_announce_update()  # a second tick must not show it twice
+
+    assert tray.calls == [("0.5.0", "https://example.test/release")]
+
+
+def test_nothing_is_announced_without_a_confirmed_update():
+    app = FunTabApp()
+    tray = _FakeTray()
+    app._tray = tray
+
+    app._maybe_announce_update()
+
+    assert tray.calls == []

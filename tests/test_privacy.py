@@ -46,6 +46,7 @@ def test_privacy_mode_forces_the_bundle():
         close_key_enabled=True,
         title_privacy="full",
         backdrop="blur",
+        check_for_updates=True,
     )
     cfg.clamp()
     assert cfg.preview_enabled is False
@@ -55,6 +56,7 @@ def test_privacy_mode_forces_the_bundle():
     assert cfg.title_privacy == "app"
     assert cfg.backdrop == "dim"
     assert cfg.dim_veil == 100
+    assert cfg.check_for_updates is False, "phoning home is exposure too"
 
 
 def test_apply_privacy_bundle_leaves_none_backdrop_alone():

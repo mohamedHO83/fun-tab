@@ -293,6 +293,13 @@ SETTINGS: tuple[Setting, ...] = (
         ),
         hint="App-only hides document names, URLs and email subjects on the wheel.",
     ),
+    Setting(
+        "check_for_updates",
+        "Check for updates",
+        "check",
+        "Privacy",
+        hint="Once per run, asks GitHub for the latest release tag. No other data is sent.",
+    ),
 )
 
 # `autostart` is a registry entry, not a config field.

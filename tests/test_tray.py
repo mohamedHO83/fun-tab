@@ -114,3 +114,52 @@ def test_demote_matches_only_our_executable(tmp_path, monkeypatch):
 
     assert tray.demote_notify_icon(str(ours)) is True
     assert calls == [("IsPromoted", 0)]
+
+
+class _DummyApp:
+    _paused_manually = False
+
+
+def test_notify_update_does_nothing_without_a_real_window():
+    """No hwnd yet (not installed) — must not touch the shell at all."""
+    icon = tray.TrayIcon(_DummyApp())
+    icon.notify_update("0.5.0", "https://example.test/release")
+    assert icon._update_url == "https://example.test/release"
+
+
+def test_notify_update_shows_a_balloon(monkeypatch):
+    import ctypes
+
+    icon = tray.TrayIcon(_DummyApp())
+    icon.hwnd = 123
+    calls = []
+
+    def fake_notify(action, nid_ref):
+        nid = ctypes.cast(nid_ref, ctypes.POINTER(w.NOTIFYICONDATAW)).contents
+        calls.append((action, nid.szInfoTitle, nid.szInfo))
+        return 1
+
+    monkeypatch.setattr(w.shell32, "Shell_NotifyIconW", fake_notify)
+    icon.notify_update("0.5.0", "https://example.test/release")
+    assert len(calls) == 1
+    action, title, body = calls[0]
+    assert action == w.NIM_MODIFY
+    assert "0.5.0" in body
+    assert title == "Fun Tab update available"
+
+
+def test_download_update_opens_the_release_page(monkeypatch):
+    icon = tray.TrayIcon(_DummyApp())
+    icon._update_url = "https://example.test/release"
+    opened = []
+    monkeypatch.setattr(tray.os, "startfile", lambda url: opened.append(url))
+    icon._on_command(tray._ID_UPDATE)
+    assert opened == ["https://example.test/release"]
+
+
+def test_download_update_is_a_no_op_with_nothing_to_download(monkeypatch):
+    icon = tray.TrayIcon(_DummyApp())
+    opened = []
+    monkeypatch.setattr(tray.os, "startfile", lambda url: opened.append(url))
+    icon._on_command(tray._ID_UPDATE)
+    assert opened == []

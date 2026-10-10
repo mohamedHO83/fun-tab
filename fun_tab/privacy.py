@@ -57,6 +57,7 @@ def apply_privacy_bundle(cfg) -> None:
     cfg.capture_minimized = False
     cfg.close_key_enabled = False
     cfg.title_privacy = "app"
+    cfg.check_for_updates = False
     cfg.dim_veil = 100
     if cfg.backdrop == "blur":
         cfg.backdrop = "dim"

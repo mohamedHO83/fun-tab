@@ -82,6 +82,11 @@ class FunTabApp:
         # so the first unrelated foreground change can dismiss the card.
         self._launch_at = 0.0
         self._launch_from = 0
+        # Set by a worker thread once a GitHub lookup confirms a newer release;
+        # the message loop is what's allowed to touch the tray icon with it.
+        self._ui_thread_id = 0
+        self._update: tuple[str, str] | None = None
+        self._update_notified = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -97,11 +102,14 @@ class FunTabApp:
         self.hook.is_sticky = lambda: self.overlay.sticky
         self.hook.has_query = lambda: bool(self.overlay.query)
         self._apply_hook_settings()
-        self.hook.set_ui_thread(int(w.kernel32.GetCurrentThreadId()))
+        self._ui_thread_id = int(w.kernel32.GetCurrentThreadId())
+        self.hook.set_ui_thread(self._ui_thread_id)
         self.hook.install()
 
         self._prewarm()
         self._start_tray()
+        if self.cfg.check_for_updates:
+            threading.Thread(target=self._check_for_update, daemon=True).start()
         self._message_loop()
 
     def shutdown(self) -> None:
@@ -118,6 +126,35 @@ class FunTabApp:
             self.overlay.prewarm_render(apps)
         except Exception:
             pass
+
+    def _check_for_update(self) -> None:
+        """Off the UI thread: a GitHub lookup must never delay startup or the
+        message loop, and must never surface as an error if it fails."""
+        from . import __version__
+        from .updates import check_for_update
+
+        time.sleep(5.0)  # let prewarm and the tray settle first
+        try:
+            release = check_for_update(__version__)
+        except Exception:
+            release = None
+        if release is None:
+            return
+        with self._lock:
+            self._update = (release.version, release.url)
+        if self._ui_thread_id:
+            w.user32.PostThreadMessageW(self._ui_thread_id, w.WM_NULL, 0, 0)
+
+    def _maybe_announce_update(self) -> None:
+        if self._update_notified:
+            return
+        with self._lock:
+            update = self._update
+        if update is None:
+            return
+        self._update_notified = True
+        if self._tray is not None:
+            self._tray.notify_update(*update)
 
     def _apply_hook_settings(self) -> None:
         self.hook.search_enabled = self.cfg.search_enabled
@@ -627,6 +664,7 @@ class FunTabApp:
                 frame_ms = max(2, int(1000 / max(30, self.cfg.max_fps)))
 
             self._apply_hook_actions()
+            self._maybe_announce_update()
 
             while w.user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
                 if msg.message == w.WM_QUIT:
