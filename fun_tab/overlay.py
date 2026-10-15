@@ -342,6 +342,11 @@ class Overlay:
 
         self._monitor = (0, 0, 1920, 1080)
         self._dpi = 96
+        # Which monitor's `scale`/`preview_position` override is in effect.
+        # Tracked separately from `_dpi` because two monitors can share a DPI
+        # while still wanting different per-monitor overrides.
+        self._monitor_id = ""
+        self._metrics_monitor_id = ""
         self._wheel_origin = (0, 0)
         self._preview_origin = (0, 0)
 
@@ -691,8 +696,9 @@ class Overlay:
 
     def _apply_metrics(self, dpi: int) -> None:
         cfg = self.cfg
-        scale = (dpi / 96.0) * cfg.scale
+        scale = (dpi / 96.0) * cfg.scale_for(self._monitor_id)
         self._dpi = dpi
+        self._metrics_monitor_id = self._monitor_id
         self.s = scale
 
         self.outer_r = max(60, int(round(cfg.outer_radius * scale)))
@@ -757,6 +763,7 @@ class Overlay:
             rect = info.rcMonitor
             self._monitor = (rect.left, rect.top, rect.right, rect.bottom)
             dpi = w.monitor_dpi(int(monitor))
+            monitor_id = w.monitor_device_name(int(monitor))
         else:
             self._monitor = (
                 0,
@@ -765,7 +772,12 @@ class Overlay:
                 w.user32.GetSystemMetrics(1),
             )
             dpi = 96
-        if dpi != self._dpi:
+            monitor_id = ""
+        self._monitor_id = monitor_id
+        # Re-measure on a DPI change as before, and also on a same-DPI move to
+        # a monitor with its own `scale` override — two screens can share a
+        # DPI while still wanting different sizes.
+        if dpi != self._dpi or monitor_id != self._metrics_monitor_id:
             self._apply_metrics(dpi)
 
     # -- show / hide -------------------------------------------------------
@@ -987,7 +999,7 @@ class Overlay:
         card_w = self.preview_w + self.preview_pad * 2
         card_h = self.preview_h + self.preview_pad * 2
         gap = self.preview_margin
-        position = self.cfg.preview_position
+        position = self.cfg.preview_position_for(self._monitor_id)
         x = left + gap
         y = top + gap
         if "right" in position:

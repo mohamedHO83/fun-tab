@@ -165,3 +165,35 @@ def test_readouts_are_plain_percentages(percent_of, value, expected):
 def test_config_keys_excludes_the_registry_toggle():
     assert "autostart" not in CONFIG_KEYS
     assert "aim_needle" in CONFIG_KEYS
+
+
+# -- per-monitor overrides ----------------------------------------------------
+
+
+def test_enabled_monitors_get_an_override():
+    from fun_tab.settings_ui import apply_monitor_overrides
+
+    cfg = Config()
+    apply_monitor_overrides(
+        cfg,
+        [
+            (r"\\.\DISPLAY1", True, 1.6, "bottom-right"),
+            (r"\\.\DISPLAY2", False, 1.0, "top-left"),
+        ],
+    )
+    assert cfg.monitor_overrides == {
+        r"\\.\DISPLAY1": {"scale": 1.6, "preview_position": "bottom-right"}
+    }
+
+
+def test_unchecking_a_monitor_clears_its_override():
+    from fun_tab.settings_ui import apply_monitor_overrides
+
+    cfg = Config(monitor_overrides={r"\\.\DISPLAY1": {"scale": 1.6}})
+    apply_monitor_overrides(cfg, [(r"\\.\DISPLAY1", False, 1.0, "top-left")])
+    assert cfg.monitor_overrides == {}
+
+
+def test_monitor_override_scale_uses_the_same_range_as_the_main_slider():
+    scale_setting = next(s for s in SETTINGS if s.key == "scale")
+    assert scale_setting.low <= 1.8 <= scale_setting.high

@@ -59,6 +59,7 @@ Everything below works while Alt is held. Release Alt to switch.
 | **Enter on a pinned app that isn't running** | Starts it |
 | **Right click a slice** | Hide this app, pin, close, or minimise |
 | **Delete**, **Ctrl+W**, **Ctrl+Q** | Close the selected window, keep the wheel open |
+| **Ctrl+Z** | Reopen whichever app you just closed |
 | **Ctrl+M** | Minimise the selected window |
 | **Ctrl+H** | Hide this app from the wheel (saved in Settings) |
 | **Ctrl+P** | Pin / unpin this app - gives it a fixed place on the wheel |
@@ -139,6 +140,8 @@ Take the absolute values with a pinch of salt - this laptop's clocks swing by 2-
 
 Click the tray icon for a settings window. Everything in it is in plain language, and the panel on the right is **a preview of your own desktop** - the real screenshot, the real window list, put through the same blur the switcher uses - so you can drag the blur slider and watch what it does rather than guess. Save applies it: the running switcher notices the file changed and reloads on its own, no restart and no **Reload settings**.
 
+**Monitors…** opens a small editor for anyone whose screens disagree about what "normal" looks like - a different wheel size or preview spot per monitor, remembered by device name. Unchecked monitors just keep using the settings on the main tabs.
+
 ![Settings window](assets/settings-window.png)
 
 The screenshot above is a demo scene (fake wallpaper, fake apps), not anyone's real desktop.
@@ -171,6 +174,7 @@ Everything still lives in `%APPDATA%\fun-tab\config.json`, written with defaults
 | `aim_needle` | `true` | The needle in the hub showing which way you're aiming |
 | `aim_origin` | `true` | The ring marking the spot your aim is measured from |
 | `show_counter`, `show_subtitle`, `show_hints` | `true` | Hub text: `n/N`, app name, key hints |
+| `sound_enabled` | `false` | A soft click on open, a tick per Tab, a thunk on commit |
 | `title_privacy` | `"full"` | `full` shows window titles; `app` shows application names only |
 | `privacy_mode` | `false` | Forces the privacy preset (no previews/prefetch/minimised capture/close keys; app labels) |
 | `mru_order` | `true` | Most-recently-used ordering |
@@ -197,13 +201,16 @@ Everything still lives in `%APPDATA%\fun-tab\config.json`, written with defaults
 | `game_compat` | `"auto"` | `auto` steps aside when a game is in front, `always` always leaves plain Alt+Tab alone, `off` takes Alt+Tab when that is the open shortcut |
 | `game_exes` | `[]` | Extra executable names auto-mode treats as games |
 | `consent_version` | `0` | First-run disclosure; bumped when the consent text changes |
+| `check_for_updates` | `true` | Once per run, ask GitHub for the latest release. No other data is sent; off under privacy mode |
 | `colors` | `{}` | Override any palette key, e.g. `{"accent": "#ff8800", "text": "#ffffff"}` |
+| `monitor_overrides` | `{}` | Per-monitor `scale`/`preview_position`, keyed by device name (e.g. `"\\.\DISPLAY1"`). Edited as **Monitors…** in Settings |
 
 ## Tray menu
 
 Windows 11 often hides a new icon behind the **^** arrow next to the clock. Fun Tab leaves it there and shows a balloon the first time it starts.
 
 - **Settings…** - the settings window, with the live preview (also a left click)
+- **Update to X…**, **What's new…**, **Open the release page** - only appear once `check_for_updates` finds a newer release. *Update to X…* downloads the installer, runs it silently, and restarts Fun Tab for you; the other two just show the notes or open the page in a browser
 - **Start with Windows** - adds Fun Tab to the per-user Run key (`FunTab.exe` from a packed build, or a `pythonw` shim from source)
 - **Pause Fun Tab** - uninstalls the keyboard and mouse hooks until you resume; the tray icon stays, labelled *paused*
 - **Edit the settings file** - opens `config.json` for the keys the window doesn't show

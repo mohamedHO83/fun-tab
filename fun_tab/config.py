@@ -119,6 +119,11 @@ class Config:
     aim_needle: bool = True  # the needle in the hub, showing the aim direction
     aim_origin: bool = True  # a ring marking the point aiming is measured from
 
+    # --- sound --------------------------------------------------------------
+    # Off by default: a switcher that makes noise the first time is a switcher
+    # people uninstall. One soft click on open, one on commit.
+    sound_enabled: bool = False
+
     # --- labels -----------------------------------------------------------
     show_counter: bool = True
     show_subtitle: bool = True
@@ -203,6 +208,47 @@ class Config:
 
     # --- raw colour overrides (theme key -> "#RRGGBB" or [r,g,b,a]) -------
     colors: dict[str, Any] = field(default_factory=dict)
+
+    # --- per-monitor overrides ---------------------------------------------
+    # Keyed by the adapter device name GetMonitorInfo reports (e.g.
+    # "\\.\DISPLAY1") — stable across a restart, not guaranteed to survive a
+    # monitor being unplugged and moved to a different port. Only `scale` and
+    # `preview_position` are worth varying by screen; everything else about
+    # the wheel does not meaningfully depend on which one it opened on.
+    monitor_overrides: dict[str, dict] = field(default_factory=dict)
+
+    def scale_for(self, monitor_id: str) -> float:
+        override = self.monitor_overrides.get(monitor_id) if monitor_id else None
+        if override and "scale" in override:
+            try:
+                return _clampf(override["scale"], 0.5, 3.0)
+            except (TypeError, ValueError):
+                pass
+        return self.scale
+
+    def preview_position_for(self, monitor_id: str) -> str:
+        override = self.monitor_overrides.get(monitor_id) if monitor_id else None
+        value = override.get("preview_position") if override else None
+        return str(value) if value else self.preview_position
+
+    def set_monitor_override(self, monitor_id: str, **values: Any) -> None:
+        """Set per-monitor fields; a ``None`` value clears that one field,
+        and a monitor left with nothing set is dropped entirely rather than
+        kept around as an empty entry."""
+        if not monitor_id:
+            return
+        entry = dict(self.monitor_overrides.get(monitor_id, {}))
+        for key, value in values.items():
+            if value is None:
+                entry.pop(key, None)
+            else:
+                entry[key] = value
+        overrides = dict(self.monitor_overrides)
+        if entry:
+            overrides[monitor_id] = entry
+        else:
+            overrides.pop(monitor_id, None)
+        self.monitor_overrides = overrides
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -319,6 +365,7 @@ class Config:
         self.pinned_exes = [
             str(slot.get("exe") or "") for slot in self.slots if slot.get("exe")
         ]
+        self.monitor_overrides = _normalize_monitor_overrides(self.monitor_overrides)
 
     def lane_slots(self) -> list[dict]:
         """The slots the wheel should reserve arc for right now."""
@@ -443,6 +490,30 @@ def _normalize_exe_names(names: list[str] | tuple[str, ...] | None) -> list[str]
             continue
         seen.add(name)
         out.append(name)
+    return out
+
+
+def _normalize_monitor_overrides(raw: dict | None) -> dict[str, dict]:
+    """Validated per-monitor overrides. Anything unrecognisable is dropped
+    rather than raised, same as every other hand-editable structure here."""
+    out: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return out
+    for monitor_id, value in raw.items():
+        monitor_id = str(monitor_id or "").strip()
+        if not monitor_id or not isinstance(value, dict):
+            continue
+        entry: dict[str, Any] = {}
+        if "scale" in value:
+            try:
+                entry["scale"] = _clampf(value["scale"], 0.5, 3.0)
+            except (TypeError, ValueError):
+                pass
+        position = value.get("preview_position")
+        if position:
+            entry["preview_position"] = str(position)
+        if entry:
+            out[monitor_id] = entry
     return out
 
 

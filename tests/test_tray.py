@@ -119,6 +119,12 @@ def test_demote_matches_only_our_executable(tmp_path, monkeypatch):
 class _DummyApp:
     _paused_manually = False
 
+    def __init__(self):
+        self.update_now_calls = 0
+
+    def update_now(self):
+        self.update_now_calls += 1
+
 
 def test_notify_update_does_nothing_without_a_real_window():
     """No hwnd yet (not installed) — must not touch the shell at all."""
@@ -163,3 +169,60 @@ def test_download_update_is_a_no_op_with_nothing_to_download(monkeypatch):
     monkeypatch.setattr(tray.os, "startfile", lambda url: opened.append(url))
     icon._on_command(tray._ID_UPDATE)
     assert opened == []
+
+
+def test_notify_update_remembers_the_notes():
+    icon = tray.TrayIcon(_DummyApp())
+    icon.notify_update("0.6.0", "https://example.test/release", "## Highlights\n- a thing")
+    assert icon._update_notes == "## Highlights\n- a thing"
+    assert icon._update_version == "0.6.0"
+
+
+def test_whats_new_shows_the_notes(monkeypatch):
+    icon = tray.TrayIcon(_DummyApp())
+    icon.notify_update("0.6.0", "https://example.test/release", "a bug fix and a feature")
+    shown = []
+    monkeypatch.setattr(
+        tray.w,
+        "message_box",
+        lambda text, title="Fun Tab", flags=0: shown.append((text, title)) or 1,
+    )
+    icon._on_command(tray._ID_WHATS_NEW)
+    assert shown == [("a bug fix and a feature", "Fun Tab 0.6.0")]
+
+
+def test_whats_new_is_a_no_op_without_notes(monkeypatch):
+    icon = tray.TrayIcon(_DummyApp())
+    shown = []
+    monkeypatch.setattr(
+        tray.w, "message_box", lambda text, title="Fun Tab", flags=0: shown.append(text) or 1
+    )
+    icon._on_command(tray._ID_WHATS_NEW)
+    assert shown == []
+
+
+def test_whats_new_menu_item_only_appears_with_notes():
+    with_notes = tray.TrayIcon(_DummyApp())
+    with_notes.notify_update("0.6.0", "https://example.test", "something changed")
+    without_notes = tray.TrayIcon(_DummyApp())
+    without_notes.notify_update("0.6.0", "https://example.test")
+    assert with_notes._update_notes
+    assert not without_notes._update_notes
+
+
+def test_long_notes_are_trimmed_for_a_message_box():
+    long_notes = "x" * 5000
+    trimmed = tray._trimmed_notes(long_notes)
+    assert len(trimmed) < len(long_notes)
+    assert "see the release page" in trimmed
+
+
+def test_short_notes_pass_through_untouched():
+    assert tray._trimmed_notes("short") == "short"
+
+
+def test_update_now_menu_item_delegates_to_the_app():
+    app = _DummyApp()
+    icon = tray.TrayIcon(app)
+    icon._on_command(tray._ID_UPDATE_NOW)
+    assert app.update_now_calls == 1

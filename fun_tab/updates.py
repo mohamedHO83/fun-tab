@@ -13,15 +13,21 @@ import json
 import re
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 REPO = "mohamedHO83/fun-tab"
 _TIMEOUT = 4.0
+_DOWNLOAD_TIMEOUT = 60.0
+INSTALLER_ASSET_NAME = "FunTabSetup.exe"
 
 
 @dataclass(frozen=True)
 class Release:
     version: str  # e.g. "0.5.0" — no leading "v"
     url: str  # the release page to open
+    notes: str = ""  # the release body, Markdown as GitHub stored it
+    installer_url: str = ""  # direct download for FunTabSetup.exe, if attached
+    installer_size: int = 0  # bytes, from the API — a cheap integrity check
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -66,7 +72,48 @@ def fetch_latest_release(repo: str = REPO, timeout: float = _TIMEOUT) -> Release
     if not tag:
         return None
     page = str(data.get("html_url") or f"https://github.com/{repo}/releases")
-    return Release(version=tag.lstrip("vV"), url=page)
+    notes = str(data.get("body") or "").strip()
+    installer_url = ""
+    installer_size = 0
+    for asset in data.get("assets") or ():
+        if not isinstance(asset, dict):
+            continue
+        if str(asset.get("name") or "").lower() == INSTALLER_ASSET_NAME.lower():
+            installer_url = str(asset.get("browser_download_url") or "")
+            try:
+                installer_size = int(asset.get("size") or 0)
+            except (TypeError, ValueError):
+                installer_size = 0
+            break
+    return Release(
+        version=tag.lstrip("vV"),
+        url=page,
+        notes=notes,
+        installer_url=installer_url,
+        installer_size=installer_size,
+    )
+
+
+def download_asset(url: str, dest: Path, *, expected_size: int = 0, timeout: float = _DOWNLOAD_TIMEOUT) -> bool:
+    """Download one release asset to ``dest``. ``False`` on any failure —
+    no internet, a timeout, a truncated transfer, a file that doesn't even
+    look like a Windows executable. Never raises.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": "fun-tab-update-check"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read()
+    except Exception:
+        return False
+    if expected_size and len(data) != expected_size:
+        return False
+    if data[:2] != b"MZ":  # the DOS header every PE (.exe) starts with
+        return False
+    try:
+        dest.write_bytes(data)
+    except OSError:
+        return False
+    return True
 
 
 def check_for_update(

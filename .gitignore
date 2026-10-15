@@ -19,3 +19,4 @@ htmlcov/
 .env
 .env.*
 *.json.checkbak
+ROADMAP.md

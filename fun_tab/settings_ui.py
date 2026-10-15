@@ -64,6 +64,13 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("show_counter", "Show the position counter in the middle", "check", "Look"),
     Setting("show_subtitle", "Show the app name under the title", "check", "Look"),
     Setting("show_hints", "Show the keyboard hints at the bottom", "check", "Look"),
+    Setting(
+        "sound_enabled",
+        "Play sounds for opening, tabbing and switching",
+        "check",
+        "Look",
+        hint="A soft click to open, a tick per Tab, a thunk when you switch. Off by default.",
+    ),
     # -- Background ---------------------------------------------------------
     Setting(
         "backdrop",
@@ -457,9 +464,14 @@ class SettingsWindow:
         buttons = ttk.Frame(left)
         buttons.grid(row=1, column=0, sticky="ew", pady=(self.px(12), 0))
         buttons.columnconfigure(1, weight=1)
-        ttk.Button(buttons, text="Reset to defaults", command=self.on_reset).grid(
+        left_buttons = ttk.Frame(buttons)
+        left_buttons.grid(row=0, column=0, sticky="w")
+        ttk.Button(left_buttons, text="Reset to defaults", command=self.on_reset).grid(
             row=0, column=0
         )
+        ttk.Button(
+            left_buttons, text="Monitors…", command=self.on_edit_monitors
+        ).grid(row=0, column=1, padx=(self.px(6), 0))
         ttk.Button(buttons, text="Cancel", command=self.on_cancel).grid(
             row=0, column=2, padx=(0, self.px(6))
         )
@@ -1004,6 +1016,25 @@ class SettingsWindow:
         self.on_change()
         self.status.configure(text="Defaults restored — press Save to keep them.")
 
+    def on_edit_monitors(self) -> None:
+        from . import win32_types as w
+
+        try:
+            monitors = w.enumerate_monitors()
+        except Exception:
+            monitors = []
+        if not monitors:
+            self.status.configure(
+                text="Could not detect any monitors.", foreground="#b3261e"
+            )
+            return
+        if _edit_monitor_overrides(self.root, self.cfg, monitors, self.ui):
+            self.status.configure(
+                text="Monitor overrides updated — press Save to keep them.",
+                foreground="#1a7f37",
+            )
+            self.on_change()
+
     def on_save(self) -> None:
         cfg = self.collect()
         if not cfg.save():
@@ -1152,6 +1183,129 @@ def _capture_hotkey(timeout_s: float = 6.0):
             w.user32.UnhookWindowsHookEx(kb_hook)
 
     return result[0] if result else None
+
+
+def apply_monitor_overrides(
+    cfg: Config, entries: list[tuple[str, bool, float, str]]
+) -> None:
+    """Pure: write (or clear) each monitor's override on ``cfg``.
+
+    Pulled out of the dialog itself so the actual decision — override vs. use
+    the main setting — is testable without a display, the same way the rest
+    of this window's Tk-to-Config mapping is.
+    """
+    for device, enabled, scale, preview_position in entries:
+        if enabled:
+            cfg.set_monitor_override(device, scale=scale, preview_position=preview_position)
+        else:
+            cfg.set_monitor_override(device, scale=None, preview_position=None)
+
+
+def _edit_monitor_overrides(
+    parent,
+    cfg: Config,
+    monitors: list[tuple[str, tuple[int, int, int, int]]],
+    ui: float = 1.0,
+) -> bool:
+    """A size and preview-spot per monitor, for anyone whose screens disagree
+    about what "normal" looks like. Writes straight into ``cfg`` — the
+    ordinary Save button is what persists it, same as everything else.
+
+    Returns whether anything was actually changed.
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    scale_setting = next(s for s in SETTINGS if s.key == "scale")
+    position_setting = next(s for s in SETTINGS if s.key == "preview_position")
+    position_labels = [label for _value, label in position_setting.choices]
+
+    changed = [False]
+    dialog = tk.Toplevel(parent)
+    dialog.title("Per-monitor overrides")
+    dialog.transient(parent)
+    dialog.resizable(False, False)
+    pad = max(1, int(round(10 * ui)))
+
+    ttk.Label(
+        dialog,
+        text="Give a monitor its own size or preview spot. Unchecked monitors "
+        "keep using the settings on the main tabs.",
+        wraplength=max(1, int(round(380 * ui))),
+    ).grid(row=0, column=0, columnspan=4, sticky="w", padx=pad, pady=(pad, pad))
+
+    rows: list[tuple[str, tk.BooleanVar, tk.DoubleVar, tk.StringVar]] = []
+    row = 1
+    for device, (left, top, right, bottom) in monitors:
+        existing = cfg.monitor_overrides.get(device, {})
+        enabled_var = tk.BooleanVar(value=bool(existing))
+        scale_var = tk.DoubleVar(value=float(existing.get("scale", cfg.scale)))
+        position_var = tk.StringVar(
+            value=_label_for(
+                position_setting, existing.get("preview_position", cfg.preview_position)
+            )
+        )
+
+        ttk.Checkbutton(
+            dialog,
+            text=f"{device}  ({right - left}×{bottom - top})",
+            variable=enabled_var,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", padx=pad, pady=(pad, 0))
+        row += 1
+
+        readout = ttk.Label(dialog, text=format_percent(scale_setting, scale_var.get()), width=5)
+
+        def on_slide(_value, var=scale_var, label=readout):
+            label.configure(text=format_percent(scale_setting, float(var.get())))
+
+        ttk.Label(dialog, text="Size").grid(row=row, column=0, sticky="w", padx=(pad * 2, 4))
+        ttk.Scale(
+            dialog,
+            from_=scale_setting.low,
+            to=scale_setting.high,
+            variable=scale_var,
+            command=on_slide,
+            length=int(round(140 * ui)),
+        ).grid(row=row, column=1, sticky="w")
+        readout.grid(row=row, column=1, sticky="e", padx=(0, pad))
+        ttk.Label(dialog, text="Preview").grid(row=row, column=2, sticky="w", padx=(pad, 4))
+        ttk.Combobox(
+            dialog,
+            textvariable=position_var,
+            state="readonly",
+            values=position_labels,
+            width=16,
+        ).grid(row=row, column=3, sticky="w")
+        row += 1
+
+        rows.append((device, enabled_var, scale_var, position_var))
+
+    def save() -> None:
+        entries = [
+            (
+                device,
+                bool(enabled_var.get()),
+                float(scale_var.get()),
+                _value_for(position_setting, position_var.get()),
+            )
+            for device, enabled_var, scale_var, position_var in rows
+        ]
+        apply_monitor_overrides(cfg, entries)
+        changed[0] = True
+        dialog.destroy()
+
+    def cancel() -> None:
+        dialog.destroy()
+
+    buttons = ttk.Frame(dialog)
+    buttons.grid(row=row, column=0, columnspan=4, sticky="e", padx=pad, pady=pad)
+    ttk.Button(buttons, text="Save", command=save).pack(side="right")
+    ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right", padx=(0, pad))
+    dialog.bind("<Return>", lambda _e: save())
+    dialog.bind("<Escape>", lambda _e: cancel())
+    dialog.grab_set()
+    parent.wait_window(dialog)
+    return changed[0]
 
 
 def _pick_exe(parent, ui: float = 1.0) -> str:

@@ -379,6 +379,68 @@ def test_higher_dpi_produces_a_bigger_canvas():
     assert (o.canvas_w, o.canvas_h) > small
 
 
+# -- per-monitor overrides ---------------------------------------------------
+
+
+def test_apply_metrics_uses_the_monitor_scale_override():
+    o = wheel(scale=1.0, monitor_overrides={r"\\.\DISPLAY2": {"scale": 2.0}})
+
+    o._monitor_id = r"\\.\DISPLAY1"
+    o._apply_metrics(96)
+    plain = o.outer_r
+
+    o._monitor_id = r"\\.\DISPLAY2"
+    o._apply_metrics(96)
+    overridden = o.outer_r
+
+    assert overridden > plain
+
+
+def test_preview_position_follows_the_monitor_override():
+    o = wheel(preview_position="top-left")
+    o.cfg.monitor_overrides = {r"\\.\DISPLAY2": {"preview_position": "bottom-right"}}
+
+    o._monitor_id = r"\\.\DISPLAY1"
+    top_left = o._preview_position(0, 0, 1000, 800)
+
+    o._monitor_id = r"\\.\DISPLAY2"
+    bottom_right = o._preview_position(0, 0, 1000, 800)
+
+    assert bottom_right[0] > top_left[0]
+    assert bottom_right[1] > top_left[1]
+
+
+def test_update_monitor_reapplies_metrics_on_a_same_dpi_monitor_change(monkeypatch):
+    from fun_tab import win32_types as w
+
+    o = wheel(scale=1.0, monitor_overrides={r"\\.\DISPLAY2": {"scale": 2.0}})
+    monitors = {111: (r"\\.\DISPLAY1", 96), 222: (r"\\.\DISPLAY2", 96)}
+    current = {"hmon": 111}
+
+    monkeypatch.setattr(w.user32, "GetCursorPos", lambda p: None)
+    monkeypatch.setattr(w.user32, "MonitorFromPoint", lambda pt, flag: current["hmon"])
+    monkeypatch.setattr(
+        w.user32,
+        "GetMonitorInfoW",
+        lambda hmon, info_ref: (
+            setattr(info_ref._obj.rcMonitor, "right", 1920)
+            or setattr(info_ref._obj.rcMonitor, "bottom", 1080)
+            or True
+        ),
+    )
+    monkeypatch.setattr(w, "monitor_dpi", lambda hmon: monitors[hmon][1])
+    monkeypatch.setattr(w, "monitor_device_name", lambda hmon: monitors[hmon][0])
+
+    o._update_monitor()
+    first = o.outer_r
+
+    current["hmon"] = 222
+    o._update_monitor()
+    second = o.outer_r
+
+    assert second > first, "same DPI, different monitor override — metrics must still refresh"
+
+
 def test_reconfiguring_drops_the_cached_pixels():
     o = wheel()
     o._compose(time.perf_counter())

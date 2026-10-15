@@ -232,6 +232,87 @@ def test_close_selected_asks_once_per_session(monkeypatch):
     assert closed == [9, 9]
 
 
+def test_closing_a_window_remembers_it_for_undo(monkeypatch):
+    from fun_tab.app import FunTabApp
+    from fun_tab.windows_enum import AppWindow
+
+    app = FunTabApp()
+    app.cfg = Config(close_confirm=False)
+    target = AppWindow(
+        hwnd=9, title="Notes", class_name="Notepad", pid=1, app_name="Notepad"
+    )
+    app.overlay._visible = True
+    app.overlay._apps = [target]
+    app.overlay._all_apps = [target]
+    app.overlay._selected = 0
+
+    monkeypatch.setattr("fun_tab.app.close_window", lambda hwnd: True)
+    app._close_selected()
+
+    assert app._last_closed is target
+
+
+def test_an_elevated_window_that_refuses_to_close_is_not_remembered(monkeypatch):
+    from fun_tab.app import FunTabApp
+    from fun_tab.windows_enum import AppWindow
+
+    app = FunTabApp()
+    app.cfg = Config(close_confirm=False)
+    target = AppWindow(
+        hwnd=9, title="Notes", class_name="Notepad", pid=1, app_name="Notepad"
+    )
+    app.overlay._visible = True
+    app.overlay._apps = [target]
+    app.overlay._all_apps = [target]
+    app.overlay._selected = 0
+
+    monkeypatch.setattr("fun_tab.app.close_window", lambda hwnd: False)
+    monkeypatch.setattr(w, "message_box", lambda *a, **k: w.IDOK)
+    app._close_selected()
+
+    assert app._last_closed is None
+
+
+def test_ctrl_z_relaunches_whatever_was_last_closed(monkeypatch):
+    from fun_tab.app import FunTabApp
+    from fun_tab.windows_enum import AppWindow
+
+    app = FunTabApp()
+    target = AppWindow(
+        hwnd=0,
+        title="Notes",
+        class_name="Notepad",
+        pid=1,
+        app_name="Notepad",
+        exe_path=r"C:\Windows\notepad.exe",
+    )
+    app._last_closed = target
+    app.overlay._visible = True
+
+    launched = []
+    monkeypatch.setattr(
+        "fun_tab.app.launch_app", lambda target, fallback="": launched.append(target) or True
+    )
+
+    app._reopen_last_closed()
+
+    assert launched == [r"C:\Windows\notepad.exe"]
+    assert app.overlay.visible is False, "reopening hides the wheel, like a commit does"
+
+
+def test_ctrl_z_does_nothing_when_nothing_has_been_closed(monkeypatch):
+    app = FunTabApp()
+    assert app._last_closed is None
+    launched = []
+    monkeypatch.setattr(
+        "fun_tab.app.launch_app", lambda target, fallback="": launched.append(target) or True
+    )
+
+    app._reopen_last_closed()  # must not raise
+
+    assert launched == []
+
+
 def test_ensure_consent_accepts_and_persists(tmp_path, monkeypatch):
     from fun_tab.app import _ensure_consent
     from fun_tab.privacy import CONSENT_VERSION
@@ -352,20 +433,22 @@ class _FakeTray:
     def __init__(self):
         self.calls = []
 
-    def notify_update(self, version, url):
-        self.calls.append((version, url))
+    def notify_update(self, version, url, notes=""):
+        self.calls.append((version, url, notes))
 
 
 def test_a_confirmed_update_is_announced_once():
     app = FunTabApp()
     tray = _FakeTray()
     app._tray = tray
-    app._update = ("0.5.0", "https://example.test/release")
+    app._update = ("0.5.0", "https://example.test/release", "## Highlights\n- a thing")
 
     app._maybe_announce_update()
     app._maybe_announce_update()  # a second tick must not show it twice
 
-    assert tray.calls == [("0.5.0", "https://example.test/release")]
+    assert tray.calls == [
+        ("0.5.0", "https://example.test/release", "## Highlights\n- a thing")
+    ]
 
 
 def test_nothing_is_announced_without_a_confirmed_update():
@@ -376,3 +459,301 @@ def test_nothing_is_announced_without_a_confirmed_update():
     app._maybe_announce_update()
 
     assert tray.calls == []
+
+
+def test_sound_default_is_off():
+    assert Config().sound_enabled is False
+
+
+def test_sound_is_silent_when_turned_off(monkeypatch):
+    app = FunTabApp()
+    app.cfg.sound_enabled = False
+    calls = []
+    monkeypatch.setattr("fun_tab.sound.play", lambda name: calls.append(name))
+    app._play_sound("open")
+    assert calls == []
+
+
+def test_sound_plays_when_turned_on(monkeypatch):
+    app = FunTabApp()
+    app.cfg.sound_enabled = True
+    calls = []
+    monkeypatch.setattr("fun_tab.sound.play", lambda name: calls.append(name))
+    app._play_sound("commit")
+    assert calls == ["commit"]
+
+
+def test_commit_plays_a_sound_only_when_something_is_actually_selected(monkeypatch):
+    from fun_tab.windows_enum import AppWindow
+
+    app = FunTabApp()
+    app.cfg.sound_enabled = True
+    played = []
+    monkeypatch.setattr(app, "_play_sound", lambda name: played.append(name))
+    monkeypatch.setattr("fun_tab.app.activate_window", lambda hwnd: True)
+
+    # Nothing open: commit() must not make noise for doing nothing.
+    app.commit()
+    assert played == []
+
+    target = AppWindow(hwnd=9, title="Notes", class_name="Notepad", pid=1)
+    app.overlay._visible = True
+    app.overlay._apps = [target]
+    app.overlay._all_apps = [target]
+    app.overlay._selected = 0
+
+    app.commit()
+    assert played == ["commit"]
+
+
+def test_open_wheel_plays_a_sound_only_when_it_actually_opens(monkeypatch):
+    app = FunTabApp()
+    app.cfg = Config(sound_enabled=True)  # not the real on-disk config and its pins
+    played = []
+    monkeypatch.setattr(app, "_play_sound", lambda name: played.append(name))
+
+    # Already open: open_wheel() must not fire a second "open" sound.
+    app.overlay._visible = True
+    app.open_wheel()
+    assert played == []
+
+    app.overlay._visible = False
+    monkeypatch.setattr("fun_tab.app.enumerate_windows", lambda **_k: [])
+    app.open_wheel()
+    assert played == [], "no apps to show means nothing actually opened"
+
+    from fun_tab.windows_enum import AppWindow
+
+    target = AppWindow(hwnd=9, title="Notes", class_name="Notepad", pid=1)
+    monkeypatch.setattr("fun_tab.app.enumerate_windows", lambda **_k: [target])
+    monkeypatch.setattr(app.overlay, "show", lambda *a, **k: None)
+
+    app.open_wheel()
+    assert played == ["open"]
+
+
+def test_update_now_does_nothing_without_a_confirmed_update(monkeypatch):
+    app = FunTabApp()
+    started = []
+    monkeypatch.setattr(
+        "threading.Thread",
+        lambda *a, **k: started.append(1) or _FakeThread(),
+    )
+    app.update_now()
+    assert started == []
+
+
+class _FakeThread:
+    def start(self):
+        pass
+
+
+def test_update_now_will_not_start_twice_at_once(monkeypatch):
+    app = FunTabApp()
+    app._update = ("0.6.0", "https://example.test/release", "")
+    started = []
+    monkeypatch.setattr(
+        "threading.Thread", lambda *a, **k: started.append(a) or _FakeThread()
+    )
+    app.update_now()
+    app.update_now()
+    assert len(started) == 1
+
+
+def test_apply_update_now_falls_back_when_running_from_source(monkeypatch):
+    app = FunTabApp()
+    monkeypatch.setattr("fun_tab.paths.frozen", lambda: False)
+    opened = []
+    monkeypatch.setattr("os.startfile", lambda url: opened.append(url))
+
+    app._apply_update_now("https://example.test/release")
+
+    assert opened == ["https://example.test/release"]
+    assert app._updating_now is False
+    assert app._running is True
+
+
+def test_apply_update_now_falls_back_without_an_installer_asset(monkeypatch):
+    app = FunTabApp()
+    monkeypatch.setattr("fun_tab.paths.frozen", lambda: True)
+    monkeypatch.setattr("fun_tab.updates.fetch_latest_release", lambda repo: None)
+    opened = []
+    shown = []
+    monkeypatch.setattr("os.startfile", lambda url: opened.append(url))
+    monkeypatch.setattr(w, "message_box", lambda text, **k: shown.append(text) or 1)
+
+    app._apply_update_now("https://example.test/release")
+
+    assert opened == ["https://example.test/release"]
+    assert len(shown) == 1
+    assert app._running is True
+
+
+def test_apply_update_now_falls_back_when_the_download_fails(monkeypatch):
+    from fun_tab.updates import Release
+
+    app = FunTabApp()
+    monkeypatch.setattr("fun_tab.paths.frozen", lambda: True)
+    monkeypatch.setattr(
+        "fun_tab.updates.fetch_latest_release",
+        lambda repo: Release(version="0.6.0", url="x", installer_url="https://dl/x.exe", installer_size=10),
+    )
+    monkeypatch.setattr("fun_tab.updates.download_asset", lambda *a, **k: False)
+    opened = []
+    monkeypatch.setattr("os.startfile", lambda url: opened.append(url))
+    monkeypatch.setattr(w, "message_box", lambda *a, **k: 1)
+
+    app._apply_update_now("https://example.test/release")
+
+    assert opened == ["https://example.test/release"]
+    assert app._running is True
+
+
+def test_apply_update_now_falls_back_when_the_installer_wont_start(monkeypatch, tmp_path):
+    from fun_tab.updates import Release
+
+    app = FunTabApp()
+    monkeypatch.setattr("fun_tab.paths.frozen", lambda: True)
+    monkeypatch.setattr(
+        "fun_tab.updates.fetch_latest_release",
+        lambda repo: Release(version="0.6.0", url="x", installer_url="https://dl/x.exe", installer_size=10),
+    )
+
+    def fake_download(url, dest, expected_size=0, timeout=0):
+        dest.write_bytes(b"MZ" + b"\x00" * 8)
+        return True
+
+    monkeypatch.setattr("fun_tab.updates.download_asset", fake_download)
+    monkeypatch.setattr("tempfile.mkdtemp", lambda prefix="": str(tmp_path))
+
+    def boom(*a, **k):
+        raise OSError("blocked")
+
+    monkeypatch.setattr("subprocess.Popen", boom)
+    opened = []
+    monkeypatch.setattr("os.startfile", lambda url: opened.append(url))
+    monkeypatch.setattr(w, "message_box", lambda *a, **k: 1)
+
+    app._apply_update_now("https://example.test/release")
+
+    assert opened == ["https://example.test/release"]
+    assert app._running is True
+
+
+def test_apply_update_now_falls_back_when_the_installer_exits_immediately(monkeypatch, tmp_path):
+    from fun_tab.updates import Release
+
+    app = FunTabApp()
+    monkeypatch.setattr("fun_tab.paths.frozen", lambda: True)
+    monkeypatch.setattr(
+        "fun_tab.updates.fetch_latest_release",
+        lambda repo: Release(version="0.6.0", url="x", installer_url="https://dl/x.exe", installer_size=10),
+    )
+
+    def fake_download(url, dest, expected_size=0, timeout=0):
+        dest.write_bytes(b"MZ" + b"\x00" * 8)
+        return True
+
+    monkeypatch.setattr("fun_tab.updates.download_asset", fake_download)
+    monkeypatch.setattr("tempfile.mkdtemp", lambda prefix="": str(tmp_path))
+
+    class DeadProc:
+        returncode = 1
+
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: DeadProc())
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    opened = []
+    monkeypatch.setattr("os.startfile", lambda url: opened.append(url))
+    monkeypatch.setattr(w, "message_box", lambda *a, **k: 1)
+
+    app._apply_update_now("https://example.test/release")
+
+    assert opened == ["https://example.test/release"]
+    assert app._running is True
+
+
+def test_apply_update_now_succeeds_and_stops_the_loop(monkeypatch, tmp_path):
+    from fun_tab.updates import Release
+
+    app = FunTabApp()
+    app._ui_thread_id = 4242
+    monkeypatch.setattr("fun_tab.paths.frozen", lambda: True)
+    monkeypatch.setattr(
+        "fun_tab.updates.fetch_latest_release",
+        lambda repo: Release(version="0.6.0", url="x", installer_url="https://dl/x.exe", installer_size=10),
+    )
+
+    def fake_download(url, dest, expected_size=0, timeout=0):
+        dest.write_bytes(b"MZ" + b"\x00" * 8)
+        return True
+
+    monkeypatch.setattr("fun_tab.updates.download_asset", fake_download)
+    monkeypatch.setattr("tempfile.mkdtemp", lambda prefix="": str(tmp_path))
+
+    class AliveProc:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    posted = []
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: AliveProc())
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    monkeypatch.setattr(
+        "fun_tab.win32_types.user32.PostThreadMessageW",
+        lambda tid, msg, wp, lp: posted.append(tid) or 1,
+    )
+
+    app._apply_update_now("https://example.test/release")
+
+    assert app._running is False
+    assert posted == [4242]
+
+
+def test_cycling_plays_a_sound(monkeypatch):
+    from fun_tab import hook as hook_actions
+    from fun_tab.hook import Action
+    from fun_tab.windows_enum import AppWindow
+
+    app = FunTabApp()
+    app.cfg.sound_enabled = True
+    target = AppWindow(hwnd=1, title="A", class_name="C", pid=1)
+    app.overlay._visible = True
+    app.overlay._apps = [target]
+    app.overlay._all_apps = [target]
+    app.overlay._selected = 0
+
+    played = []
+    monkeypatch.setattr(app, "_play_sound", lambda name: played.append(name))
+
+    app._dispatch(Action(hook_actions.CYCLE, 1))
+    app._dispatch(Action(hook_actions.SAME_APP, 1))
+
+    assert played == ["cycle", "cycle"]
+
+
+def test_first_and_last_do_not_play_the_cycle_sound(monkeypatch):
+    """Home/End jump to an endpoint; they aren't "tabbing" in the sense the
+    cycle tick is meant to give feedback for."""
+    from fun_tab import hook as hook_actions
+    from fun_tab.hook import Action
+    from fun_tab.windows_enum import AppWindow
+
+    app = FunTabApp()
+    app.cfg.sound_enabled = True
+    target = AppWindow(hwnd=1, title="A", class_name="C", pid=1)
+    app.overlay._visible = True
+    app.overlay._apps = [target]
+    app.overlay._all_apps = [target]
+    app.overlay._selected = 0
+
+    played = []
+    monkeypatch.setattr(app, "_play_sound", lambda name: played.append(name))
+
+    app._dispatch(Action(hook_actions.FIRST))
+    app._dispatch(Action(hook_actions.LAST))
+
+    assert played == []

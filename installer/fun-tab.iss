@@ -48,4 +48,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "FunTab"; ValueData: """{app}\{#MyAppExeName}"""; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch Fun Tab"; Flags: nowait postinstall skipifsilent
+; No `skipifsilent`: a silent run is exactly what Fun Tab's own "Update now"
+; uses to re-launch itself after replacing its own files, so this has to fire
+; in that case too, not just for someone double-clicking the installer.
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch Fun Tab"; Flags: nowait postinstall

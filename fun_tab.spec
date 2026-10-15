@@ -7,7 +7,12 @@ a = Analysis(
     ["launch.py"],
     pathex=[],
     binaries=[],
-    datas=[("assets/fun-tab.ico", "assets")],
+    datas=[
+        ("assets/fun-tab.ico", "assets"),
+        ("assets/sounds/open.wav", "assets/sounds"),
+        ("assets/sounds/commit.wav", "assets/sounds"),
+        ("assets/sounds/cycle.wav", "assets/sounds"),
+    ],
     hiddenimports=collect_submodules("fun_tab")
     + [
         "tkinter",

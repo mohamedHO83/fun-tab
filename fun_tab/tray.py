@@ -37,6 +37,8 @@ _ID_RELOAD = 5
 _ID_ABOUT = 6
 _ID_QUIT = 7
 _ID_UPDATE = 8
+_ID_WHATS_NEW = 9
+_ID_UPDATE_NOW = 10
 
 
 def _guid() -> w.GUID:
@@ -138,6 +140,8 @@ class TrayIcon:
         self._wndproc = None
         self._taskbar_created = 0
         self._update_url: str | None = None
+        self._update_version: str = ""
+        self._update_notes: str = ""
 
     def install(self) -> bool:
         hinstance = w.kernel32.GetModuleHandleW(None)
@@ -185,16 +189,18 @@ class TrayIcon:
         nid.uID = 1
         w.shell32.Shell_NotifyIconW(w.NIM_MODIFY, ctypes.byref(nid))
 
-    def notify_update(self, version: str, url: str) -> None:
-        """A balloon plus a standing menu item, the one time a newer release
+    def notify_update(self, version: str, url: str, notes: str = "") -> None:
+        """A balloon plus standing menu items, the one time a newer release
         is confirmed. Called from the UI thread, same as everything else that
         talks to the shell — the lookup itself runs on a worker thread."""
         self._update_url = url
+        self._update_version = version
+        self._update_notes = notes.strip()
         if not self.hwnd:
             return
         nid = self._nid(w.NIF_INFO)
         nid.szInfoTitle = "Fun Tab update available"
-        nid.szInfo = f"Version {version} is ready. Right-click the tray icon to download it."
+        nid.szInfo = f"Version {version} is ready. Right-click the tray icon for details."
         nid.dwInfoFlags = w.NIIF_INFO | w.NIIF_NOSOUND
         if w.shell32.Shell_NotifyIconW(w.NIM_MODIFY, ctypes.byref(nid)):
             return
@@ -296,7 +302,11 @@ class TrayIcon:
             w.user32.SetMenuDefaultItem(menu, _ID_SETTINGS, 0)
             w.user32.AppendMenuW(menu, w.MF_SEPARATOR, 0, None)
             if self._update_url:
-                w.user32.AppendMenuW(menu, w.MF_STRING, _ID_UPDATE, "Download update…")
+                label = f"Update to {self._update_version}…" if self._update_version else "Update now…"
+                w.user32.AppendMenuW(menu, w.MF_STRING, _ID_UPDATE_NOW, label)
+                if self._update_notes:
+                    w.user32.AppendMenuW(menu, w.MF_STRING, _ID_WHATS_NEW, "What's new…")
+                w.user32.AppendMenuW(menu, w.MF_STRING, _ID_UPDATE, "Open the release page")
                 w.user32.AppendMenuW(menu, w.MF_SEPARATOR, 0, None)
             auto_flags = w.MF_STRING | (
                 w.MF_CHECKED if autostart.is_enabled() else w.MF_UNCHECKED
@@ -353,11 +363,30 @@ class TrayIcon:
             )
         elif choice == _ID_ABOUT:
             self.app.show_about()
+        elif choice == _ID_UPDATE_NOW:
+            self.app.update_now()
         elif choice == _ID_UPDATE:
             if self._update_url:
                 try:
                     os.startfile(self._update_url)  # noqa: S606 - user-initiated
                 except OSError:
                     pass
+        elif choice == _ID_WHATS_NEW:
+            if self._update_notes:
+                w.message_box(
+                    _trimmed_notes(self._update_notes),
+                    title=f"Fun Tab {self._update_version}".strip(),
+                    flags=w.MB_OK | w.MB_ICONINFORMATION,
+                )
         elif choice == _ID_QUIT:
             self.app.shutdown()
+
+
+_MAX_NOTES_CHARS = 2000
+
+
+def _trimmed_notes(notes: str) -> str:
+    """A `MessageBoxW` is a status dialog, not a document viewer."""
+    if len(notes) <= _MAX_NOTES_CHARS:
+        return notes
+    return notes[:_MAX_NOTES_CHARS].rstrip() + "\n\n… (see the release page for the rest)"

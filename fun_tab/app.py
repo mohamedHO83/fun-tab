@@ -82,11 +82,15 @@ class FunTabApp:
         # so the first unrelated foreground change can dismiss the card.
         self._launch_at = 0.0
         self._launch_from = 0
+        # Ctrl+Z while the wheel is open relaunches whichever app this was —
+        # a one-deep memory, not a stack, overwritten by the next close.
+        self._last_closed = None
         # Set by a worker thread once a GitHub lookup confirms a newer release;
         # the message loop is what's allowed to touch the tray icon with it.
         self._ui_thread_id = 0
-        self._update: tuple[str, str] | None = None
+        self._update: tuple[str, str, str] | None = None  # version, url, notes
         self._update_notified = False
+        self._updating_now = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -141,7 +145,7 @@ class FunTabApp:
         if release is None:
             return
         with self._lock:
-            self._update = (release.version, release.url)
+            self._update = (release.version, release.url, release.notes)
         if self._ui_thread_id:
             w.user32.PostThreadMessageW(self._ui_thread_id, w.WM_NULL, 0, 0)
 
@@ -155,6 +159,89 @@ class FunTabApp:
         self._update_notified = True
         if self._tray is not None:
             self._tray.notify_update(*update)
+
+    def update_now(self) -> None:
+        """One click from the tray: download the installer, run it silently,
+        and exit so it can replace this process's own files.
+
+        The network call and the installer launch happen off the UI thread,
+        same as the check itself — only the final "please quit" has to come
+        back here, because `PostQuitMessage` only means anything on the
+        thread that calls it.
+        """
+        with self._lock:
+            update = self._update
+        if update is None or self._updating_now:
+            return
+        self._updating_now = True
+        threading.Thread(
+            target=self._apply_update_now, args=(update[1],), daemon=True
+        ).start()
+
+    def _apply_update_now(self, release_page_url: str) -> None:
+        from . import paths
+
+        def fall_back(message: str | None = None) -> None:
+            if message:
+                w.message_box(message, flags=w.MB_OK | w.MB_ICONWARNING)
+            try:
+                import os
+
+                os.startfile(release_page_url)  # noqa: S606 - user-initiated
+            except OSError:
+                pass
+            self._updating_now = False
+
+        if not paths.frozen():
+            # Running from source: there is no installer to silently re-run —
+            # a `pip install` / `git pull` is the update, not a download.
+            fall_back()
+            return
+
+        from .updates import REPO, download_asset, fetch_latest_release
+
+        release = fetch_latest_release(REPO)
+        if release is None or not release.installer_url:
+            fall_back("Could not find an installer for the new version.")
+            return
+
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="funtab-update-"))
+        installer_path = tmp_dir / "FunTabSetup.exe"
+        if not download_asset(
+            release.installer_url, installer_path, expected_size=release.installer_size
+        ):
+            fall_back("Could not download the update. Opening the release page instead.")
+            return
+
+        try:
+            proc = subprocess.Popen(
+                [
+                    str(installer_path),
+                    "/VERYSILENT",
+                    "/SUPPRESSMSGBOXES",
+                    "/NORESTART",
+                    "/CLOSEAPPLICATIONS",
+                ]
+            )
+        except OSError:
+            fall_back("Could not start the installer. Opening the release page instead.")
+            return
+
+        time.sleep(0.5)  # long enough for an immediate failure (bad args, blocked by AV) to show
+        if proc.poll() is not None and proc.returncode != 0:
+            fall_back("The installer could not start. Opening the release page instead.")
+            return
+
+        # From here the installer owns the machine: it closes this process to
+        # replace its files and launches the new one when it's done. Setting
+        # `_running` is enough — the loop's own teardown runs once it notices.
+        self._running = False
+        if self._ui_thread_id:
+            w.user32.PostThreadMessageW(self._ui_thread_id, w.WM_NULL, 0, 0)
 
     def _apply_hook_settings(self) -> None:
         self.hook.search_enabled = self.cfg.search_enabled
@@ -328,6 +415,7 @@ class FunTabApp:
             self.overlay.show(
                 apps, selected=selected, sticky=sticky, expand_fan=same_app
             )
+        self._play_sound("open")
 
     @staticmethod
     def _initial_index(
@@ -370,6 +458,7 @@ class FunTabApp:
             self.overlay.hide()
         if app is None:
             return
+        self._play_sound("commit")
         if app.hwnd:
             activate_window(app.hwnd)
             self.tracker.note(app.hwnd)
@@ -378,6 +467,13 @@ class FunTabApp:
         # entry at the end of a fan. Launching a closed app is just the case
         # where that fan has one entry, so there is no separate launch path.
         self._launch(app)
+
+    def _play_sound(self, name: str) -> None:
+        if not self.cfg.sound_enabled:
+            return
+        from . import sound
+
+        sound.play(name)
 
     def _launch(self, app) -> None:
         target = app.launch or launch_target(app)
@@ -442,6 +538,7 @@ class FunTabApp:
 
         if kind == hook_actions.CYCLE:
             overlay.cycle(int(value))
+            self._play_sound("cycle")
         elif kind == hook_actions.COMMIT:
             self.commit()
         elif kind == hook_actions.CANCEL:
@@ -458,6 +555,7 @@ class FunTabApp:
             overlay.last()
         elif kind == hook_actions.SAME_APP:
             overlay.cycle_same_app(int(value))
+            self._play_sound("cycle")
         elif kind == hook_actions.JUMP:
             if overlay.jump(int(value)):
                 self.commit()
@@ -471,6 +569,8 @@ class FunTabApp:
             self._hide_selected_app()
         elif kind == hook_actions.PIN:
             self._toggle_pin_selected()
+        elif kind == hook_actions.REOPEN_CLOSED:
+            self._reopen_last_closed()
 
     def _close_selected(self) -> None:
         app = self.overlay.selected_app()
@@ -490,12 +590,22 @@ class FunTabApp:
         if hwnd:
             if close_window(hwnd):
                 self.tracker.forget(hwnd)
+                # A one-deep "undo" slot, not a stack: the next close just
+                # overwrites it, same as every other "last thing you did" memory.
+                self._last_closed = app
             else:
                 w.message_box(
                     "That window belongs to an elevated app, so Fun Tab "
                     "cannot close it.",
                     flags=w.MB_OK | w.MB_ICONWARNING,
                 )
+
+    def _reopen_last_closed(self) -> None:
+        if self._last_closed is None:
+            return
+        with self._lock:
+            self.overlay.hide()
+        self._launch(self._last_closed)
 
     def _persist_config(self) -> None:
         self.cfg.save()

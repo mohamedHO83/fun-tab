@@ -469,10 +469,26 @@ def test_close_keys_can_be_disabled():
     assert kb.kinds() == []
 
 
-def test_ctrl_letters_are_not_typed_into_the_query():
+def test_ctrl_z_reopens_whatever_was_just_closed():
     kb = Keyboard(opened=True)
     kb.ctrl = True
     kb.press(0x5A)  # Ctrl+Z
+    assert kb.kinds() == [hook_mod.REOPEN_CLOSED]
+
+
+def test_ctrl_z_is_gated_by_close_key_enabled_too():
+    """It's the undo for Delete/Ctrl+W, so turning those off turns this off."""
+    kb = Keyboard(opened=True)
+    kb.hook.close_key_enabled = False
+    kb.ctrl = True
+    kb.press(0x5A)
+    assert kb.kinds() == []
+
+
+def test_ctrl_letters_are_not_typed_into_the_query():
+    kb = Keyboard(opened=True)
+    kb.ctrl = True
+    kb.press(0x4B)  # Ctrl+K — not bound to anything
     assert kb.kinds() == []
 
 

@@ -208,3 +208,78 @@ def test_dark_and_light_palettes_differ_in_luminance():
 def test_hover_reads_as_accented_against_idle():
     theme = Theme.build(Config(theme="dark", accent="#ff0000"))
     assert theme.slice_hover[0] > theme.slice_idle[0]
+
+
+# -- per-monitor overrides ---------------------------------------------------
+
+
+def test_scale_for_falls_back_to_the_global_value():
+    cfg = Config(scale=1.4)
+    assert cfg.scale_for(r"\\.\DISPLAY1") == 1.4
+    assert cfg.scale_for("") == 1.4
+
+
+def test_scale_for_uses_the_monitor_override_when_set():
+    cfg = Config(scale=1.0, monitor_overrides={r"\\.\DISPLAY2": {"scale": 1.8}})
+    assert cfg.scale_for(r"\\.\DISPLAY2") == 1.8
+    assert cfg.scale_for(r"\\.\DISPLAY1") == 1.0, "a different monitor keeps the global value"
+
+
+def test_preview_position_for_falls_back_and_overrides():
+    cfg = Config(
+        preview_position="top-left",
+        monitor_overrides={r"\\.\DISPLAY2": {"preview_position": "bottom-right"}},
+    )
+    assert cfg.preview_position_for(r"\\.\DISPLAY1") == "top-left"
+    assert cfg.preview_position_for(r"\\.\DISPLAY2") == "bottom-right"
+
+
+def test_set_monitor_override_adds_and_clears_fields():
+    cfg = Config()
+    cfg.set_monitor_override(r"\\.\DISPLAY1", scale=1.6)
+    assert cfg.monitor_overrides[r"\\.\DISPLAY1"] == {"scale": 1.6}
+
+    cfg.set_monitor_override(r"\\.\DISPLAY1", preview_position="bottom-left")
+    assert cfg.monitor_overrides[r"\\.\DISPLAY1"] == {
+        "scale": 1.6,
+        "preview_position": "bottom-left",
+    }
+
+    cfg.set_monitor_override(r"\\.\DISPLAY1", scale=None)
+    assert cfg.monitor_overrides[r"\\.\DISPLAY1"] == {"preview_position": "bottom-left"}
+
+    cfg.set_monitor_override(r"\\.\DISPLAY1", preview_position=None)
+    assert r"\\.\DISPLAY1" not in cfg.monitor_overrides, "an empty entry is dropped, not kept"
+
+
+def test_set_monitor_override_ignores_an_empty_monitor_id():
+    cfg = Config()
+    cfg.set_monitor_override("", scale=1.5)
+    assert cfg.monitor_overrides == {}
+
+
+def test_monitor_overrides_round_trip_through_a_save(tmp_path):
+    path = tmp_path / "config.json"
+    cfg = Config(monitor_overrides={r"\\.\DISPLAY1": {"scale": 1.2, "preview_position": "bottom-center"}})
+    cfg.save(path)
+    loaded = Config.load(path)
+    assert loaded.monitor_overrides == {
+        r"\\.\DISPLAY1": {"scale": 1.2, "preview_position": "bottom-center"}
+    }
+
+
+def test_monitor_overrides_are_sanitised_on_clamp():
+    cfg = Config(
+        monitor_overrides={
+            r"\\.\DISPLAY1": {"scale": 99.0, "junk_key": "nope"},
+            "": {"scale": 1.0},  # no monitor id: unusable, dropped
+            "  ": {"scale": 1.0},
+            r"\\.\DISPLAY2": "not even a dict",
+            r"\\.\DISPLAY3": {},  # nothing worth keeping
+        }
+    )
+    cfg.clamp()
+    assert cfg.monitor_overrides == {r"\\.\DISPLAY1": {"scale": 3.0}}, (
+        "an out-of-range scale clamps instead of sticking, junk keys drop, "
+        "and an id with nothing useful left is removed entirely"
+    )

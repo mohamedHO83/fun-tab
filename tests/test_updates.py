@@ -59,6 +59,29 @@ def test_fetch_latest_release_reads_the_tag_and_page(monkeypatch):
     assert release == updates.Release(version="0.5.0", url="https://example.test/release")
 
 
+def test_fetch_latest_release_carries_the_notes(monkeypatch):
+    def fake_urlopen(request, timeout):
+        return _FakeResponse(
+            {
+                "tag_name": "v0.6.0",
+                "html_url": "https://example.test/release",
+                "body": "## Highlights\n- a thing\n",
+            }
+        )
+
+    monkeypatch.setattr(updates.urllib.request, "urlopen", fake_urlopen)
+    release = updates.fetch_latest_release()
+    assert release.notes == "## Highlights\n- a thing"
+
+
+def test_fetch_latest_release_notes_default_to_empty(monkeypatch):
+    def fake_urlopen(request, timeout):
+        return _FakeResponse({"tag_name": "v0.5.0"})
+
+    monkeypatch.setattr(updates.urllib.request, "urlopen", fake_urlopen)
+    assert updates.fetch_latest_release().notes == ""
+
+
 def test_fetch_latest_release_skips_a_prerelease(monkeypatch):
     def fake_urlopen(request, timeout):
         return _FakeResponse({"tag_name": "v0.5.0", "prerelease": True})
@@ -117,3 +140,92 @@ def test_check_for_update_passes_none_through(monkeypatch):
         updates, "fetch_latest_release", lambda repo=updates.REPO, timeout=updates._TIMEOUT: None
     )
     assert updates.check_for_update("0.4.0") is None
+
+
+def test_fetch_latest_release_finds_the_installer_asset(monkeypatch):
+    def fake_urlopen(request, timeout):
+        return _FakeResponse(
+            {
+                "tag_name": "v0.6.0",
+                "html_url": "https://example.test/release",
+                "assets": [
+                    {"name": "FunTab.zip", "browser_download_url": "https://dl/zip", "size": 111},
+                    {
+                        "name": "FunTabSetup.exe",
+                        "browser_download_url": "https://dl/setup.exe",
+                        "size": 2048,
+                    },
+                ],
+            }
+        )
+
+    monkeypatch.setattr(updates.urllib.request, "urlopen", fake_urlopen)
+    release = updates.fetch_latest_release()
+    assert release.installer_url == "https://dl/setup.exe"
+    assert release.installer_size == 2048
+
+
+def test_fetch_latest_release_without_an_installer_asset(monkeypatch):
+    def fake_urlopen(request, timeout):
+        return _FakeResponse({"tag_name": "v0.6.0", "assets": [{"name": "FunTab.zip"}]})
+
+    monkeypatch.setattr(updates.urllib.request, "urlopen", fake_urlopen)
+    release = updates.fetch_latest_release()
+    assert release.installer_url == ""
+    assert release.installer_size == 0
+
+
+class _FakeBinaryResponse:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_download_asset_writes_the_file(monkeypatch, tmp_path):
+    payload = b"MZ" + b"\x00" * 100
+    monkeypatch.setattr(
+        updates.urllib.request, "urlopen", lambda *_a, **_k: _FakeBinaryResponse(payload)
+    )
+    dest = tmp_path / "FunTabSetup.exe"
+    assert updates.download_asset("https://dl/setup.exe", dest, expected_size=len(payload))
+    assert dest.read_bytes() == payload
+
+
+def test_download_asset_rejects_a_size_mismatch(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        updates.urllib.request, "urlopen", lambda *_a, **_k: _FakeBinaryResponse(b"MZ" + b"\x00" * 10)
+    )
+    dest = tmp_path / "FunTabSetup.exe"
+    assert not updates.download_asset("https://dl/setup.exe", dest, expected_size=99999)
+    assert not dest.exists()
+
+
+def test_download_asset_rejects_something_that_is_not_an_exe(monkeypatch, tmp_path):
+    """A redirected-to HTML error page must not get a free pass as an installer."""
+    monkeypatch.setattr(
+        updates.urllib.request,
+        "urlopen",
+        lambda *_a, **_k: _FakeBinaryResponse(b"<html>404</html>"),
+    )
+    dest = tmp_path / "FunTabSetup.exe"
+    assert not updates.download_asset("https://dl/setup.exe", dest)
+    assert not dest.exists()
+
+
+def test_download_asset_never_raises_when_offline(monkeypatch, tmp_path):
+    from urllib.error import URLError
+
+    def fail(*_a, **_k):
+        raise URLError("offline")
+
+    monkeypatch.setattr(updates.urllib.request, "urlopen", fail)
+    dest = tmp_path / "FunTabSetup.exe"
+    assert not updates.download_asset("https://dl/setup.exe", dest)

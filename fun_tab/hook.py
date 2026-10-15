@@ -25,6 +25,7 @@ CLOSE = "close"
 MINIMIZE = "minimize"
 HIDE = "hide"
 PIN = "pin"
+REOPEN_CLOSED = "reopen_closed"  # Ctrl+Z: relaunch whatever was just closed
 TYPE = "type"
 BACKSPACE = "backspace"
 CLEAR = "clear"
@@ -531,6 +532,9 @@ class AltTabHook:
                 return True
             if self._ctrl_held() and vk == 0x4D:  # Ctrl+M
                 self._emit(MINIMIZE)
+                return True
+            if self._ctrl_held() and vk == 0x5A:  # Ctrl+Z
+                self._emit(REOPEN_CLOSED)
                 return True
 
         if self._ctrl_held() and vk == 0x48:  # Ctrl+H

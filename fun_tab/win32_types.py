@@ -212,6 +212,26 @@ class MONITORINFO(ctypes.Structure):
     ]
 
 
+CCHDEVICENAME = 32
+
+
+class MONITORINFOEXW(ctypes.Structure):
+    """`MONITORINFO` plus the adapter device name (e.g. ``\\\\.\\DISPLAY1``).
+
+    `GetMonitorInfoW` tells the two apart by `cbSize` alone — same function,
+    bigger struct — so this is used wherever the device name is wanted
+    instead of plain `MONITORINFO`.
+    """
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * CCHDEVICENAME),
+    ]
+
+
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [
         ("biSize", wintypes.DWORD),
@@ -772,6 +792,58 @@ def monitor_dpi(hmonitor: int) -> int:
     except (AttributeError, OSError):
         pass
     return 96
+
+
+def monitor_device_name(hmonitor: int) -> str:
+    """The adapter device name for a monitor (e.g. ``\\\\.\\DISPLAY1``).
+
+    `GetMonitorInfoW`'s `argtypes` are already locked to plain `MONITORINFO`
+    everywhere else it's called, so the bigger struct is passed through a
+    cast rather than by re-declaring the function — the API only looks at
+    `cbSize` to know how much it's allowed to write, and this buffer is big
+    enough either way.
+
+    Stable enough to remember a per-monitor preference between opens, not
+    guaranteed to survive Windows renumbering displays after a monitor is
+    unplugged and moved to a different port.
+    """
+    try:
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        ptr = ctypes.cast(ctypes.byref(info), ctypes.POINTER(MONITORINFO))
+        if not user32.GetMonitorInfoW(wintypes.HMONITOR(hmonitor), ptr):
+            return ""
+        return str(info.szDevice or "")
+    except OSError:
+        return ""
+
+
+_MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_int, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(RECT), ctypes.c_double
+)
+
+
+def enumerate_monitors() -> list[tuple[str, tuple[int, int, int, int]]]:
+    """``(device name, rect)`` for every monitor currently connected.
+
+    Used only by Settings to list what a per-monitor override could apply
+    to — the wheel itself only ever asks about whichever one the cursor is
+    on, via `monitor_device_name`.
+    """
+    found: list[tuple[str, tuple[int, int, int, int]]] = []
+
+    def callback(hmonitor, _hdc, rect_ptr, _data):
+        rect = rect_ptr.contents
+        name = monitor_device_name(int(hmonitor))
+        if name:
+            found.append((name, (rect.left, rect.top, rect.right, rect.bottom)))
+        return 1
+
+    try:
+        user32.EnumDisplayMonitors(None, None, _MONITORENUMPROC(callback), 0)
+    except OSError:
+        return []
+    return found
 
 
 # ---------------------------------------------------------------------------
